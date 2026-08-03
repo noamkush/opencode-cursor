@@ -87,9 +87,9 @@ const { accessToken, url, path: rpcPath, unary } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+// Cursor can take time before the first token, but outgoing heartbeats must
+// not keep a request alive when Cursor has stopped responding.
+let timeout = setTimeout(killBridge, 120_000);
 
 function resetTimeout() {
   clearTimeout(timeout);
@@ -97,6 +97,9 @@ function resetTimeout() {
 }
 
 function killBridge() {
+  if (process.env.CURSOR_PROXY_DEBUG) {
+    console.error("[h2-bridge] timed out waiting for a Cursor response");
+  }
   clearTimeout(timeout);
   client.destroy();
   process.exit(1);
@@ -161,7 +164,6 @@ if (unary) {
         break;
       }
       if (!h2Stream.closed && !h2Stream.destroyed) {
-        resetTimeout();
         h2Stream.write(msg);
       }
     }

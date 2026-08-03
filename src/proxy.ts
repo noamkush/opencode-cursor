@@ -308,7 +308,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: process.env.CURSOR_PROXY_DEBUG ? "inherit" : "ignore",
   });
 
   const config = JSON.stringify({
