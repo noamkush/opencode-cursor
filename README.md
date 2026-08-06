@@ -83,7 +83,10 @@ Conversation history is rebuilt from the OpenAI messages on every request
 (`rootPromptMessagesJson` + content-addressed turn blobs), and server
 checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
 context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
-handshake and exec traffic when debugging.
+handshake, bridge stderr, stream lifecycle, and exec correlation traffic when
+debugging. Diagnostics are appended as JSONL to
+`$XDG_DATA_HOME/opencode/log/cursor-proxy.jsonl` (or
+`~/.local/share/opencode/log/cursor-proxy.jsonl`), alongside OpenCode's data.
 
 ## Develop locally
 
