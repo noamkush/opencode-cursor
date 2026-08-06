@@ -97,12 +97,14 @@ function resetTimeout() {
 }
 
 function killBridge() {
+  console.error("[h2-bridge] upstream inactive for too long");
   clearTimeout(timeout);
   client.destroy();
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (error) => {
+  console.error("[h2-bridge] client error:", error);
   clearTimeout(timeout);
   process.exit(1);
 });
@@ -126,6 +128,9 @@ const h2Stream = client.request(headers);
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
   resetTimeout();
+  if (process.env.CURSOR_PROXY_DEBUG) {
+    console.error(`[h2-bridge] upstream response chunk ${chunk.length} bytes`);
+  }
   writeMessage(chunk);
 });
 
@@ -136,7 +141,8 @@ h2Stream.on("end", () => {
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
+h2Stream.on("error", (error) => {
+  console.error("[h2-bridge] stream error:", error);
   clearTimeout(timeout);
   client.close();
   process.exit(1);

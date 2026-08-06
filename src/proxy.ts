@@ -13,7 +13,7 @@
  * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
  * because Bun's node:http2 module is broken.
  */
-import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson, type UnknownField } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
@@ -74,7 +74,7 @@ import {
   type NativeExecBinding,
 } from "./native-tools";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
@@ -82,11 +82,35 @@ import { z } from "zod";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+const DEBUG_LOG_PATH = pathResolve(
+  process.env.XDG_DATA_HOME ?? pathResolve(homedir(), ".local", "share"),
+  "opencode",
+  "log",
+  "cursor-proxy.jsonl",
+);
+const DEBUG = Boolean(process.env.CURSOR_PROXY_DEBUG);
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
+
+/** Write opt-in diagnostics beside OpenCode's data without exposing prompts or tokens. */
+function debugLog(event: string, details: Record<string, unknown> = {}): void {
+  if (!DEBUG) return;
+  const line = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
+  console.error(`[cursor-proxy] ${event}`, details);
+  void mkdir(pathResolve(DEBUG_LOG_PATH, ".."), { recursive: true })
+    .then(() => appendFile(DEBUG_LOG_PATH, `${line}\n`))
+    .catch(() => {});
+}
+
+function contentDiagnostics(text: string): { textBytes: number; textSha256: string } {
+  return {
+    textBytes: Buffer.byteLength(text, "utf8"),
+    textSha256: createHash("sha256").update(text).digest("hex"),
+  };
+}
 
 interface OpenAIToolCall {
   id: string;
@@ -308,7 +332,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
   });
 
   const config = JSON.stringify({
@@ -323,6 +347,31 @@ function spawnBridge(options: SpawnBridgeOptions): {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+
+  void (async () => {
+    const reader = proc.stderr.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          const message = line.trim();
+          if (message) debugLog("bridge.stderr", { message });
+        }
+        if (done) {
+          const message = pending.trim();
+          if (message) debugLog("bridge.stderr", { message });
+          break;
+        }
+      }
+    } catch (error) {
+      debugLog("bridge.stderr_read_failed", { error: String(error) });
+    }
+  })();
 
   // Track exit state so late onClose registrations fire immediately.
   let exited = false;
@@ -346,13 +395,14 @@ function spawnBridge(options: SpawnBridgeOptions): {
           cbs.data?.(Buffer.from(payload));
         }
       }
-    } catch {
-      // Stream ended
+    } catch (error) {
+      debugLog("bridge.stdout_read_failed", { error: String(error) });
     }
 
     const code = await proc.exited ?? 1;
     exited = true;
     exitCode = code;
+    debugLog("bridge.closed", { code });
     cbs.close?.(code);
   })();
 
@@ -360,13 +410,19 @@ function spawnBridge(options: SpawnBridgeOptions): {
     proc,
     get alive() { return !exited; },
     write(data) {
-      try { proc.stdin.write(lpEncode(data)); } catch {}
+      try {
+        proc.stdin.write(lpEncode(data));
+      } catch (error) {
+        debugLog("bridge.write_failed", { error: String(error), bytes: data.length });
+      }
     },
     end() {
       try {
         proc.stdin.write(lpEncode(new Uint8Array(0)));
         proc.stdin.end();
-      } catch {}
+      } catch (error) {
+        debugLog("bridge.end_failed", { error: String(error) });
+      }
     },
     onData(cb) { cbs.data = cb; },
     onClose(cb) {
@@ -647,6 +703,12 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   for (const msg of messages) {
     if (msg.role === "tool") {
       const content = textContent(msg.content);
+      if (DEBUG) {
+        debugLog("tool_result.received", {
+          toolCallId: msg.tool_call_id ?? "",
+          ...contentDiagnostics(content),
+        });
+      }
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
         content,
@@ -1095,9 +1157,11 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
-    if (process.env.CURSOR_PROXY_DEBUG) {
-      console.error(`[proxy] getBlob ${blobIdKey.slice(0, 16)} ${blobData ? `hit (${blobData.length}b)` : "MISS"}`);
-    }
+    debugLog("blob.get", {
+      blobIdPrefix: blobIdKey.slice(0, 16),
+      hit: Boolean(blobData),
+      bytes: blobData?.length ?? 0,
+    });
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -1106,9 +1170,10 @@ function handleKvMessage(
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
-    if (process.env.CURSOR_PROXY_DEBUG) {
-      console.error(`[proxy] setBlob ${Buffer.from(blobId).toString("hex").slice(0, 16)} (${blobData.length}b)`);
-    }
+    debugLog("blob.set", {
+      blobIdPrefix: Buffer.from(blobId).toString("hex").slice(0, 16),
+      bytes: blobData.length,
+    });
     sendKvResponse(
       kvMsg, "setBlobResult",
       create(SetBlobResultSchema, {}),
@@ -1293,8 +1358,26 @@ function handleExecMessage(
     return;
   }
 
-  // Unknown exec type — log and ignore
-  console.error(`[proxy] unhandled exec: ${execCase}`);
+  debugLog("exec.unhandled", {
+    execCase,
+    execId: execMsg.execId,
+    execMsgId: execMsg.id,
+    unknownFields: describeUnknownExecFields(execMsg.$unknown),
+  });
+}
+
+/**
+ * Describe future protobuf oneof fields without logging their payloads, which
+ * may contain commands, paths, or tool arguments.
+ */
+export function describeUnknownExecFields(
+  unknownFields: readonly UnknownField[] | undefined,
+): Array<{ fieldNumber: number; wireType: number; encodedBytes: number }> {
+  return (unknownFields ?? []).map((field) => ({
+    fieldNumber: field.no,
+    wireType: field.wireType,
+    encodedBytes: field.data.length,
+  }));
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1439,6 +1522,19 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            debugLog("server.message", { bridgeKey, messageCase: serverMessage.message.case });
+            if (serverMessage.message.case === "conversationCheckpointUpdate") {
+              const checkpoint = serverMessage.message.value as ConversationStateStructure;
+              debugLog("checkpoint.received", {
+                bridgeKey,
+                protobufBytes: messageBytes.length,
+                serializedStateBytes: toBinary(ConversationStateStructureSchema, checkpoint).length,
+                rootPromptMessages: checkpoint.rootPromptMessagesJson.length,
+                turns: checkpoint.turns.length,
+                pendingToolCalls: checkpoint.pendingToolCalls.length,
+                summaryArchives: checkpoint.summaryArchives.length,
+              });
+            }
             processServerMessage(
               serverMessage,
               blobStore,
@@ -1455,10 +1551,18 @@ function createBridgeStreamResponse(
                   if (content) sendSSE(makeChunk({ content }));
                 }
               },
-              // onMcpExec — the model wants to execute a tool.
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
+                if (DEBUG) {
+                  debugLog("exec.emitted", {
+                    bridgeKey,
+                    execId: exec.execId,
+                    execMsgId: exec.execMsgId,
+                    toolCallId: exec.toolCallId,
+                    toolName: exec.toolName,
+                  });
+                }
 
                 const flushed = tagFilter.flush();
                 if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1503,13 +1607,17 @@ function createBridgeStreamResponse(
                 }
               },
             );
-          } catch {
-            // Skip unparseable messages
+          } catch (error) {
+            debugLog("server.message_decode_failed", {
+              bridgeKey,
+              error: error instanceof Error ? error.message : String(error),
+            });
           }
         },
         (endStreamBytes) => {
+          debugLog("server.end_stream", { bridgeKey });
           const endError = parseConnectEndStream(endStreamBytes);
-          if (process.env.CURSOR_PROXY_DEBUG) {
+          if (DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }
           if (endError) {
@@ -1617,15 +1725,40 @@ function handleToolResultResume(
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
     let text = result ? result.content : "Tool result not provided";
+    if (DEBUG) {
+      debugLog("exec.result_received", {
+        bridgeKey,
+        execId: exec.execId,
+        toolCallId: exec.toolCallId,
+        matched: Boolean(result),
+      });
+    }
     if (userText && exec.execId === lastExecId) {
       text += `\n\n<user_message>\n${userText}\n</user_message>`;
     }
 
     if (result && exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
-        bridge.write(frameConnectMessage(bytes)),
-      );
-      if (sent) continue;
+      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) => {
+        const frame = frameConnectMessage(bytes);
+        if (DEBUG) {
+          debugLog("exec.result_frame", {
+            bridgeKey,
+            execId: exec.execId,
+            toolName: exec.toolName,
+            type: "native",
+            ...contentDiagnostics(text),
+            nativeResultBytes: bytes.length,
+            connectFrameBytes: frame.length,
+          });
+        }
+        bridge.write(frame);
+      });
+      if (sent) {
+        if (DEBUG) {
+          debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "native" });
+        }
+        continue;
+      }
     }
 
     const mcpResult = result
@@ -1665,9 +1798,24 @@ function handleToolResultResume(
       message: { case: "execClientMessage", value: execClientMessage },
     });
 
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
+    const clientMessageBytes = toBinary(AgentClientMessageSchema, clientMessage);
+    const frame = frameConnectMessage(clientMessageBytes);
+    if (DEBUG) {
+      debugLog("exec.result_frame", {
+        bridgeKey,
+        execId: exec.execId,
+        toolName: exec.toolName,
+        matched: Boolean(result),
+        ...(result ? contentDiagnostics(text) : {}),
+        mcpResultBytes: toBinary(McpResultSchema, mcpResult).length,
+        clientMessageBytes: clientMessageBytes.length,
+        connectFrameBytes: frame.length,
+      });
+    }
+    bridge.write(frame);
+    if (DEBUG) {
+      debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "mcp" });
+    }
   }
 
   return createBridgeStreamResponse(
