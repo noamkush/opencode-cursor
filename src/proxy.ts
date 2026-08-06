@@ -324,6 +324,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
   end: () => void;
+  kill: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
@@ -422,6 +423,11 @@ function spawnBridge(options: SpawnBridgeOptions): {
         proc.stdin.end();
       } catch (error) {
         debugLog("bridge.end_failed", { error: String(error) });
+      }
+    },
+    kill() {
+      try { proc.kill(); } catch (error) {
+        debugLog("bridge.kill_failed", { error: String(error) });
       }
     },
     onData(cb) { cbs.data = cb; },
@@ -525,7 +531,7 @@ export async function startProxy(
 
   proxyServer = Bun.serve({
     port: 0,
-    idleTimeout: 255, // max — Cursor responses can take 30s+
+    idleTimeout: 255, // Bun max; SSE keepalives below keep long Cursor pauses alive
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -1448,6 +1454,8 @@ function createBridgeStreamResponse(
   const created = Math.floor(Date.now() / 1000);
 
   let closed = false;
+  let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  let bridgeStopped = false;
   let cancelStream: (() => void) | undefined;
   const stream = new ReadableStream({
     start(controller) {
@@ -1461,26 +1469,43 @@ function createBridgeStreamResponse(
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
       const stopBridge = () => {
+        if (bridgeStopped) return;
+        bridgeStopped = true;
         if (activeBridges.get(bridgeKey)?.bridge === bridge) {
           activeBridges.delete(bridgeKey);
         }
         clearInterval(heartbeatTimer);
         // end() only half-closes the request; killing also stops the response.
-        try { bridge.proc.kill(); } catch {}
+        bridge.kill();
       };
-      const closeController = () => {
+      const closeController = (stopConnection = false) => {
+        if (stopConnection) stopBridge();
         if (closed) return;
         closed = true;
-        controller.close();
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        try {
+          controller.close();
+        } catch {}
       };
       // A paused bridge closes its controller on purpose and stays registered
       // in activeBridges for tool-result continuation. Tearing that down would
       // break the round-trip OpenCode is about to make.
       cancelStream = () => {
         if (closed) return;
-        closed = true;
-        stopBridge();
+        closeController(true);
       };
+
+      // Bun.serve idleTimeout max is 255s. Cursor H2 heartbeats do not write
+      // to this SSE response, so comment keepalives prevent the local socket
+      // from being closed during long model pauses.
+      keepaliveTimer = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+        } catch {
+          closeController(true);
+        }
+      }, 15_000);
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -1628,8 +1653,7 @@ function createBridgeStreamResponse(
             sendSSE(makeChunk({}, "stop"));
             sendSSE(makeUsageChunk());
             sendDone();
-            stopBridge();
-            closeController();
+            closeController(true);
           }
         },
       );
@@ -1637,7 +1661,7 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
-        clearInterval(heartbeatTimer);
+        stopBridge();
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
