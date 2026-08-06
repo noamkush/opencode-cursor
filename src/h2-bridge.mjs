@@ -87,8 +87,9 @@ const { accessToken, url, path: rpcPath, unary } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
+// Guard against connection failure and a completely idle upstream. Parent
+// heartbeats deliberately do not reset this timer: they cannot prove Cursor
+// is still making progress.
 let timeout = setTimeout(killBridge, 30_000);
 
 function resetTimeout() {
@@ -167,7 +168,6 @@ if (unary) {
         break;
       }
       if (!h2Stream.closed && !h2Stream.destroyed) {
-        resetTimeout();
         h2Stream.write(msg);
       }
     }
