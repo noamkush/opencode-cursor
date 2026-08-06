@@ -5,6 +5,7 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
   GetUsableModelsResponseSchema,
+  HeartbeatUpdateSchema,
   InteractionUpdateSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -15,6 +16,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  isCursorServerHeartbeat: typeof import("../src/proxy").isCursorServerHeartbeat;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -284,6 +286,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    isCursorServerHeartbeat: proxy.isCursorServerHeartbeat,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -385,6 +388,30 @@ async function testStreamCancellationStopsBridge(
     backend.setHoldRunStream(false);
   }
   console.log("[test] SSE cancellation teardown OK");
+}
+
+function testHeartbeatClassification(modules: TestModules) {
+  console.log("[test] Testing Cursor heartbeat classification...");
+  const heartbeat = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "heartbeat", value: create(HeartbeatUpdateSchema) },
+      }),
+    },
+  });
+  const text = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "textDelta", value: { text: "progress" } },
+      }),
+    },
+  });
+
+  assert(modules.isCursorServerHeartbeat(heartbeat), "Expected heartbeat to be classified as non-progress");
+  assert(!modules.isCursorServerHeartbeat(text), "Expected text delta to be classified as progress");
+  console.log("[test] Cursor heartbeat classification OK");
 }
 
 async function testAuthParams(modules: TestModules) {
@@ -645,6 +672,7 @@ async function main() {
   try {
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
+    testHeartbeatClassification(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
