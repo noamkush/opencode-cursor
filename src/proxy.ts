@@ -30,7 +30,9 @@ import {
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
+  ExecClientControlMessageSchema,
   ExecClientMessageSchema,
+  ExecClientStreamCloseSchema,
   FetchErrorSchema,
   FetchResultSchema,
   GetBlobResultSchema,
@@ -39,7 +41,6 @@ import {
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
-  McpErrorSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -89,6 +90,9 @@ const DEBUG_LOG_PATH = pathResolve(
   "cursor-proxy.jsonl",
 );
 const DEBUG = Boolean(process.env.CURSOR_PROXY_DEBUG);
+const STREAM_STALL_TIMEOUT_MS = 90_000;
+const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
+const TOOL_BATCH_QUIET_MS = 500;
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -175,10 +179,12 @@ interface PendingExec {
 interface ActiveBridge {
   bridge: ReturnType<typeof spawnBridge>;
   heartbeatTimer: NodeJS.Timeout;
+  frameParser: ReturnType<typeof createConnectFrameParser>;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   cloudRule?: string;
   pendingExecs: PendingExec[];
+  queuedExecs: PendingExec[];
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -986,25 +992,60 @@ function makeHeartbeatBytes(): Uint8Array {
  * Create a stateful parser for Connect protocol frames.
  * Handles buffering partial data across chunks.
  */
-function createConnectFrameParser(
-  onMessage: (bytes: Uint8Array) => void,
-  onEndStream: (bytes: Uint8Array) => void,
-): (incoming: Buffer) => void {
+export function createConnectFrameParser(): {
+  process: (incoming: Buffer) => void;
+  setHandlers: (
+    onMessage: (bytes: Uint8Array) => void,
+    onEndStream: (bytes: Uint8Array) => void,
+    onError?: (error: Error, details: {
+      flags: number;
+      declaredBytes: number;
+      bufferedBytes: number;
+      incomingBytes: number;
+    }) => void,
+  ) => void;
+} {
+  let onMessage = (_bytes: Uint8Array) => {};
+  let onEndStream = (_bytes: Uint8Array) => {};
+  let onError: ((error: Error, details: {
+    flags: number;
+    declaredBytes: number;
+    bufferedBytes: number;
+    incomingBytes: number;
+  }) => void) | undefined;
   let pending = Buffer.alloc(0);
-  return (incoming: Buffer) => {
-    pending = Buffer.concat([pending, incoming]);
-    while (pending.length >= 5) {
-      const flags = pending[0]!;
-      const msgLen = pending.readUInt32BE(1);
-      if (pending.length < 5 + msgLen) break;
-      const messageBytes = pending.subarray(5, 5 + msgLen);
-      pending = pending.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG) {
-        onEndStream(messageBytes);
-      } else {
-        onMessage(messageBytes);
+  return {
+    process(incoming: Buffer) {
+      pending = Buffer.concat([pending, incoming]);
+      while (pending.length >= 5) {
+        const flags = pending[0]!;
+        const msgLen = pending.readUInt32BE(1);
+        if (msgLen > MAX_CONNECT_FRAME_BYTES) {
+          const details = {
+            flags,
+            declaredBytes: msgLen,
+            bufferedBytes: pending.length,
+            incomingBytes: incoming.length,
+          };
+          pending = Buffer.alloc(0);
+          onError?.(new Error(`Connect frame exceeds ${MAX_CONNECT_FRAME_BYTES} bytes`), details);
+          return;
+        }
+        if (pending.length < 5 + msgLen) break;
+        const messageBytes = pending.subarray(5, 5 + msgLen);
+        pending = pending.subarray(5 + msgLen);
+        if (flags & CONNECT_END_STREAM_FLAG) {
+          onEndStream(messageBytes);
+        } else {
+          onMessage(messageBytes);
+        }
       }
-    }
+    },
+    setHandlers(message, endStream, error) {
+      onMessage = message;
+      onEndStream = endStream;
+      onError = error;
+    },
   };
 }
 
@@ -1078,6 +1119,12 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+/** Cursor emits heartbeat updates while a run is alive but not progressing. */
+export function isCursorServerHeartbeat(msg: AgentServerMessage): boolean {
+  return msg.message.case === "interactionUpdate" &&
+    msg.message.value.message.case === "heartbeat";
+}
+
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -1088,6 +1135,7 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onUnhandledExec?: (execCase: string) => void,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1102,6 +1150,7 @@ function processServerMessage(
       cloudRule,
       sendFrame,
       onMcpExec,
+      onUnhandledExec,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -1194,6 +1243,7 @@ function handleExecMessage(
   cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  onUnhandledExec?: (execCase: string) => void,
 ): void {
   const execCase = execMsg.message.case;
   if (process.env.CURSOR_PROXY_DEBUG) {
@@ -1403,6 +1453,20 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  sendExecStreamClose(execMsg.id, sendFrame);
+}
+
+function sendExecStreamClose(execMsgId: number, sendFrame: (data: Uint8Array) => void): void {
+  const controlMessage = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: execMsgId }),
+    },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: controlMessage },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
@@ -1450,12 +1514,16 @@ function createBridgeStreamResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  frameParser = createConnectFrameParser(),
+  initialExecs: PendingExec[] = [],
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   let closed = false;
   let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  let toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
+  let stallTimer: ReturnType<typeof setInterval> | undefined;
   let bridgeStopped = false;
   let cancelStream: (() => void) | undefined;
   const stream = new ReadableStream({
@@ -1483,7 +1551,9 @@ function createBridgeStreamResponse(
         if (stopConnection) stopBridge();
         if (closed) return;
         closed = true;
+        if (toolBatchTimer) clearTimeout(toolBatchTimer);
         if (keepaliveTimer) clearInterval(keepaliveTimer);
+        if (stallTimer) clearInterval(stallTimer);
         try {
           controller.close();
         } catch {}
@@ -1538,18 +1608,111 @@ function createBridgeStreamResponse(
         totalTokens: 0,
       };
       const tagFilter = createThinkingTagFilter();
+      let lastMeaningfulActivity = Date.now();
+      const noteMeaningfulActivity = (event: string, details: Record<string, unknown> = {}) => {
+        lastMeaningfulActivity = Date.now();
+        debugLog(event, { bridgeKey, ...details });
+      };
+      const failStream = (message: string) => {
+        if (closed) return;
+        if (DEBUG) {
+          debugLog("stream.failed", {
+            bridgeKey,
+            message,
+            pendingExecIds: state.pendingExecs.map((exec) => exec.execId),
+          });
+        }
+        sendSSE(makeChunk({ content: `\n[Error: ${message}]` }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController(true);
+      };
+
+      stallTimer = setInterval(() => {
+        const idleMs = Date.now() - lastMeaningfulActivity;
+        if (idleMs >= STREAM_STALL_TIMEOUT_MS) {
+          failStream(`Cursor stream stalled without a server message for ${Math.round(idleMs / 1000)}s`);
+        }
+      }, 5_000);
 
       let mcpExecReceived = false;
+      const emitExec = (exec: PendingExec) => {
+        state.pendingExecs.push(exec);
+        mcpExecReceived = true;
+        if (DEBUG) {
+          debugLog("exec.emitted", {
+            bridgeKey,
+            execId: exec.execId,
+            execMsgId: exec.execMsgId,
+            toolCallId: exec.toolCallId,
+            toolName: exec.toolName,
+          });
+        }
 
-      const processChunk = createConnectFrameParser(
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+
+        const toolCallIndex = state.toolCallIndex++;
+        sendSSE(makeChunk({
+          tool_calls: [{
+            index: toolCallIndex,
+            id: exec.toolCallId,
+            type: "function",
+            function: {
+              name: exec.toolName,
+              arguments: exec.decodedArgs,
+            },
+          }],
+        }));
+
+        // Keep the bridge alive for tool result continuation.
+        const queuedExecs = activeBridges.get(bridgeKey)?.queuedExecs ?? [];
+        activeBridges.set(bridgeKey, {
+          bridge,
+          heartbeatTimer,
+          frameParser,
+          blobStore,
+          mcpTools,
+          cloudRule,
+          pendingExecs: state.pendingExecs,
+          queuedExecs,
+        });
+
+        if (toolBatchTimer) clearTimeout(toolBatchTimer);
+        toolBatchTimer = setTimeout(() => {
+          toolBatchTimer = undefined;
+          sendSSE(makeChunk({}, "tool_calls"));
+          sendDone();
+          closeController();
+        }, TOOL_BATCH_QUIET_MS);
+      };
+
+      frameParser.setHandlers(
         (messageBytes) => {
+          let serverMessage: AgentServerMessage;
           try {
-            const serverMessage = fromBinary(
+            serverMessage = fromBinary(
               AgentServerMessageSchema,
               messageBytes,
             );
-            debugLog("server.message", { bridgeKey, messageCase: serverMessage.message.case });
-            if (serverMessage.message.case === "conversationCheckpointUpdate") {
+          } catch (error) {
+            failStream(`Failed to decode Cursor server message: ${error instanceof Error ? error.message : String(error)}`);
+            return;
+          }
+
+          try {
+            const messageCase = serverMessage.message.case;
+            const interactionCase = messageCase === "interactionUpdate"
+              ? serverMessage.message.value.message.case
+              : undefined;
+            if (isCursorServerHeartbeat(serverMessage)) {
+              debugLog("server.heartbeat", { bridgeKey });
+            } else {
+              noteMeaningfulActivity("server.message", { messageCase, interactionCase });
+            }
+            if (DEBUG && messageCase === "conversationCheckpointUpdate") {
               const checkpoint = serverMessage.message.value as ConversationStateStructure;
               debugLog("checkpoint.received", {
                 bridgeKey,
@@ -1578,48 +1741,11 @@ function createBridgeStreamResponse(
                 }
               },
               (exec) => {
-                state.pendingExecs.push(exec);
-                mcpExecReceived = true;
-                if (DEBUG) {
-                  debugLog("exec.emitted", {
-                    bridgeKey,
-                    execId: exec.execId,
-                    execMsgId: exec.execMsgId,
-                    toolCallId: exec.toolCallId,
-                    toolName: exec.toolName,
-                  });
+                if (closed) {
+                  activeBridges.get(bridgeKey)?.queuedExecs.push(exec);
+                  return;
                 }
-
-                const flushed = tagFilter.flush();
-                if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
-
-                // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  mcpTools,
-                  cloudRule,
-                  pendingExecs: state.pendingExecs,
-                });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                emitExec(exec);
               },
               (checkpointBytes) => {
                 const stored = conversationStates.get(convKey);
@@ -1632,16 +1758,14 @@ function createBridgeStreamResponse(
                   persistConversation(convKey, stored);
                 }
               },
+              (execCase) => failStream(`Unsupported Cursor exec request: ${execCase}`),
             );
           } catch (error) {
-            debugLog("server.message_decode_failed", {
-              bridgeKey,
-              error: error instanceof Error ? error.message : String(error),
-            });
+            failStream(`Failed to process Cursor server message: ${error instanceof Error ? error.message : String(error)}`);
           }
         },
         (endStreamBytes) => {
-          debugLog("server.end_stream", { bridgeKey });
+          noteMeaningfulActivity("server.end_stream");
           const endError = parseConnectEndStream(endStreamBytes);
           if (DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
@@ -1657,9 +1781,14 @@ function createBridgeStreamResponse(
             closeController(true);
           }
         },
+        (error, details) => {
+          debugLog("connect_frame.oversize", { bridgeKey, limitBytes: MAX_CONNECT_FRAME_BYTES, ...details });
+          failStream(error.message);
+        },
       );
+      for (const exec of initialExecs) emitExec(exec);
 
-      bridge.onData(processChunk);
+      bridge.onData(frameParser.process);
 
       bridge.onClose((code) => {
         stopBridge();
@@ -1677,15 +1806,15 @@ function createBridgeStreamResponse(
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
+        } else {
+          // A paused bridge must remain alive until OpenCode returns every
+          // tool result. A clean exit here is still a lost continuation.
           // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+          sendSSE(makeChunk({ content: `\n[Error: bridge connection lost (exit ${code})]` }));
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
           activeBridges.delete(bridgeKey);
         }
       });
@@ -1736,33 +1865,58 @@ function handleToolResultResume(
   bridgeKey: string,
   convKey: string,
 ): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
+  const {
+    bridge,
+    heartbeatTimer,
+    frameParser,
+    blobStore,
+    mcpTools,
+    cloudRule,
+    pendingExecs,
+    queuedExecs,
+  } = active;
+  const matchedExecs = pendingExecs.filter((exec) =>
+    toolResults.some((result) => result.toolCallId === exec.toolCallId)
+  );
+  const initialExecs = [
+    ...pendingExecs.filter((exec) =>
+      !toolResults.some((result) => result.toolCallId === exec.toolCallId)
+    ),
+    ...queuedExecs.splice(0),
+  ];
+  // Construct the response before writing results so its synchronous start()
+  // installs handlers before any continuation frame can arrive.
+  const response = createBridgeStreamResponse(
+    bridge, heartbeatTimer,
+    blobStore, mcpTools, cloudRule,
+    modelId, bridgeKey, convKey, frameParser, initialExecs,
+  );
 
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
-  const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
-  for (const exec of pendingExecs) {
+  const lastExecId = matchedExecs[matchedExecs.length - 1]?.execId;
+  for (const exec of matchedExecs) {
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
-    );
+    )!;
     // A user message sent alongside tool results (e.g. the explanation typed
     // after rejecting an edit) would otherwise be dropped: the paused bridge
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
-    let text = result ? result.content : "Tool result not provided";
+    let text = result.content;
     if (DEBUG) {
       debugLog("exec.result_received", {
         bridgeKey,
         execId: exec.execId,
         toolCallId: exec.toolCallId,
-        matched: Boolean(result),
+        matched: true,
       });
     }
     if (userText && exec.execId === lastExecId) {
       text += `\n\n<user_message>\n${userText}\n</user_message>`;
     }
 
-    if (result && exec.native) {
+    if (exec.native) {
       const sent = sendNativeExecResult(exec, exec.native, text, (bytes) => {
         const frame = frameConnectMessage(bytes);
         if (DEBUG) {
@@ -1779,6 +1933,7 @@ function handleToolResultResume(
         bridge.write(frame);
       });
       if (sent) {
+        sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
         if (DEBUG) {
           debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "native" });
         }
@@ -1786,29 +1941,22 @@ function handleToolResultResume(
       }
     }
 
-    const mcpResult = result
-      ? create(McpResultSchema, {
-          result: {
-            case: "success",
-            value: create(McpSuccessSchema, {
-              content: [
-                create(McpToolResultContentItemSchema, {
-                  content: {
-                    case: "text",
-                    value: create(McpTextContentSchema, { text }),
-                  },
-                }),
-              ],
-              isError: false,
+    const mcpResult = create(McpResultSchema, {
+      result: {
+        case: "success",
+        value: create(McpSuccessSchema, {
+          content: [
+            create(McpToolResultContentItemSchema, {
+              content: {
+                case: "text",
+                value: create(McpTextContentSchema, { text }),
+              },
             }),
-          },
-        })
-      : create(McpResultSchema, {
-          result: {
-            case: "error",
-            value: create(McpErrorSchema, { error: text }),
-          },
-        });
+          ],
+          isError: false,
+        }),
+      },
+    });
 
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,
@@ -1822,7 +1970,6 @@ function handleToolResultResume(
     const clientMessage = create(AgentClientMessageSchema, {
       message: { case: "execClientMessage", value: execClientMessage },
     });
-
     const clientMessageBytes = toBinary(AgentClientMessageSchema, clientMessage);
     const frame = frameConnectMessage(clientMessageBytes);
     if (DEBUG) {
@@ -1830,24 +1977,21 @@ function handleToolResultResume(
         bridgeKey,
         execId: exec.execId,
         toolName: exec.toolName,
-        matched: Boolean(result),
-        ...(result ? contentDiagnostics(text) : {}),
+        matched: true,
+        ...contentDiagnostics(text),
         mcpResultBytes: toBinary(McpResultSchema, mcpResult).length,
         clientMessageBytes: clientMessageBytes.length,
         connectFrameBytes: frame.length,
       });
     }
     bridge.write(frame);
+    sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
     if (DEBUG) {
       debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "mcp" });
     }
   }
 
-  return createBridgeStreamResponse(
-    bridge, heartbeatTimer,
-    blobStore, mcpTools, cloudRule,
-    modelId, bridgeKey, convKey,
-  );
+  return response;
 }
 
 async function handleNonStreamingResponse(
@@ -1902,13 +2046,23 @@ async function collectFullResponse(
   };
   const tagFilter = createThinkingTagFilter();
 
-  bridge.onData(createConnectFrameParser(
+  const frameParser = createConnectFrameParser();
+  frameParser.setHandlers(
     (messageBytes) => {
+      let serverMessage: AgentServerMessage;
       try {
-        const serverMessage = fromBinary(
+        serverMessage = fromBinary(
           AgentServerMessageSchema,
           messageBytes,
         );
+      } catch (error) {
+        debugLog("server.message_decode_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+
+      try {
         processServerMessage(
           serverMessage,
           payload.blobStore,
@@ -1932,12 +2086,15 @@ async function collectFullResponse(
             }
           },
         );
-      } catch {
-        // Skip
+      } catch (error) {
+        debugLog("server.message_process_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     },
     () => {},
-  ));
+  );
+  bridge.onData(frameParser.process);
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
