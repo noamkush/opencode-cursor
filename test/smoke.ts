@@ -1,13 +1,16 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
+  type AgentServerMessage,
 } from "../src/proto/agent_pb";
 import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
 import type CursorV2PluginModule from "../src/v2";
@@ -18,6 +21,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  createConnectFrameParser: typeof import("../src/proxy").createConnectFrameParser;
   isCursorServerHeartbeat: typeof import("../src/proxy").isCursorServerHeartbeat;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
@@ -42,6 +46,7 @@ interface TestCursorBackend {
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   setHoldRunStream: (hold: boolean) => void;
+  setRunFrames: (frames: Buffer[]) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -109,19 +114,55 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
 
 /** A Connect-framed text delta, enough to make the proxy emit its first SSE chunk. */
 function frameRunTextDelta(text: string): Buffer {
-  return frameConnectUnaryMessage(
-    toBinary(
-      AgentServerMessageSchema,
-      create(AgentServerMessageSchema, {
-        message: {
-          case: "interactionUpdate",
-          value: create(InteractionUpdateSchema, {
-            message: { case: "textDelta", value: { text } },
-          }),
-        },
-      }),
-    ),
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: { case: "textDelta", value: { text } },
+        }),
+      },
+    }),
   );
+}
+
+function frameAgentMessage(message: AgentServerMessage): Buffer {
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, message));
+}
+
+function frameMcpExec(toolCallId: string, toolName = "read", id = 1): Buffer {
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "execServerMessage",
+        value: create(ExecServerMessageSchema, {
+          id,
+          execId: `exec-${id}`,
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: toolName,
+              toolName,
+              toolCallId,
+            }),
+          },
+        }),
+      },
+    }),
+  );
+}
+
+async function collectSseEvents(res: Response): Promise<any[]> {
+  const text = await res.text();
+  const events: any[] = [];
+  for (const block of text.split("\n\n")) {
+    const line = block.split("\n").find((item) => item.startsWith("data: "));
+    if (!line) continue;
+    const data = line.slice(6).trim();
+    if (!data || data === "[DONE]") continue;
+    events.push(JSON.parse(data));
+  }
+  return events;
 }
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
@@ -134,6 +175,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let runStreamClosed = Promise.withResolvers<void>();
   const heldRunStreams = new Set<http2.ServerHttp2Stream>();
   let holdRunStream = false;
+  let runFrames: Buffer[] | null = null;
   const refreshAuthHeaders: string[] = [];
 
   const refreshServer = http.createServer((req, res) => {
@@ -177,12 +219,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         heldRunStreams.delete(stream);
         closed.resolve();
       });
-      if (holdRunStream) {
+      if (runFrames) {
+        for (const frame of runFrames) stream.write(frame);
+      } else if (holdRunStream) {
         // Cancellation can only be observed on a stream still running when the
         // client goes away. Bun also withholds SSE response headers until the
         // first body byte, so emit one to unblock the caller's fetch.
-        heldRunStreams.add(stream);
         stream.write(frameRunTextDelta("streaming"));
+      }
+      if (holdRunStream) {
+        heldRunStreams.add(stream);
       } else {
         stream.end();
       }
@@ -261,11 +307,15 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         for (const stream of heldRunStreams) stream.close();
       }
     },
+    setRunFrames(frames) {
+      runFrames = frames;
+    },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
       runStreamClosed = Promise.withResolvers<void>();
+      runFrames = null;
     },
     waitForRunStreamClose() {
       return runStreamClosed.promise;
@@ -303,6 +353,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    createConnectFrameParser: proxy.createConnectFrameParser,
     isCursorServerHeartbeat: proxy.isCursorServerHeartbeat,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
@@ -430,6 +481,31 @@ function testHeartbeatClassification(modules: TestModules) {
   assert(modules.isCursorServerHeartbeat(heartbeat), "Expected heartbeat to be classified as non-progress");
   assert(!modules.isCursorServerHeartbeat(text), "Expected text delta to be classified as progress");
   console.log("[test] Cursor heartbeat classification OK");
+}
+
+function testConnectFrameParserHandoff(modules: TestModules) {
+  console.log("[test] Testing Connect frame parser handoff...");
+  const message = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "heartbeat", value: create(HeartbeatUpdateSchema) },
+      }),
+    },
+  });
+  const frame = frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, message));
+  const parser = modules.createConnectFrameParser();
+  const received: Uint8Array[] = [];
+
+  parser.setHandlers((bytes) => received.push(bytes), () => {});
+  parser.process(frame.subarray(0, 3));
+  parser.setHandlers((bytes) => received.push(bytes), () => {});
+  parser.process(frame.subarray(3));
+
+  assertEqual(received.length, 1, "Expected one message after parser handoff");
+  const decoded = fromBinary(AgentServerMessageSchema, received[0]!);
+  assert(modules.isCursorServerHeartbeat(decoded), "Expected handed-off frame to decode as heartbeat");
+  console.log("[test] Connect frame parser handoff OK");
 }
 
 async function testAuthParams(modules: TestModules) {
@@ -998,6 +1074,69 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function postChat(port: number, body: Record<string, unknown>): Promise<Response> {
+  return fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function testMissingParallelResultIsReemitted(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing missing parallel result recovery...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunFrames([
+    frameMcpExec("call-first", "read", 1),
+    frameMcpExec("call-late", "skill", 2),
+  ]);
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "parallel-result-recovery" }],
+    });
+    await collectSseEvents(first);
+
+    const second = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [
+        { role: "user", content: "parallel-result-recovery" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call-first", type: "function", function: { name: "read", arguments: "{}" } },
+            { id: "call-late", type: "function", function: { name: "skill", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call-first", content: "ok" },
+      ],
+    });
+    const events = await collectSseEvents(second);
+    const toolCallIds = events.flatMap((event) =>
+      event.choices?.flatMap((choice: any) =>
+        choice.delta?.tool_calls?.map((call: any) => call.id) ?? []
+      ) ?? []
+    );
+    assertArrayEqual(toolCallIds, ["call-late"], "Expected missing parallel call to be re-emitted");
+    assert(
+      !JSON.stringify(events).includes("Tool result not provided"),
+      "Expected no fabricated tool failure",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+    backend.resetObservations();
+  }
+  console.log("[test] Missing parallel result recovery OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1009,6 +1148,7 @@ async function main() {
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
     testHeartbeatClassification(modules);
+    testConnectFrameParserHandoff(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
@@ -1016,6 +1156,7 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testV2Plugin(modules, backend);
+    await testMissingParallelResultIsReemitted(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
