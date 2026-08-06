@@ -1370,6 +1370,7 @@ function handleExecMessage(
     execMsgId: execMsg.id,
     unknownFields: describeUnknownExecFields(execMsg.$unknown),
   });
+  onUnhandledExec?.(execCase ?? "unknown");
 }
 
 /**
