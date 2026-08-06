@@ -88,6 +88,8 @@ const DEBUG_LOG_PATH = pathResolve(
   "log",
   "cursor-proxy.jsonl",
 );
+const STREAM_STALL_TIMEOUT_MS = 90_000;
+const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -335,6 +337,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
   end: () => void;
+  kill: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
@@ -423,6 +426,11 @@ function spawnBridge(options: SpawnBridgeOptions): {
         proc.stdin.end();
       } catch (error) {
         debugLog("bridge.end_failed", { error: String(error) });
+      }
+    },
+    kill() {
+      try { proc.kill(); } catch (error) {
+        debugLog("bridge.kill_failed", { error: String(error) });
       }
     },
     onData(cb) { cbs.data = cb; },
@@ -526,7 +534,7 @@ export async function startProxy(
 
   proxyServer = Bun.serve({
     port: 0,
-    idleTimeout: 255, // max — Cursor responses can take 30s+
+    idleTimeout: 255, // Bun max; SSE keepalives below keep long Cursor pauses alive
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -982,6 +990,12 @@ function makeHeartbeatBytes(): Uint8Array {
 function createConnectFrameParser(
   onMessage: (bytes: Uint8Array) => void,
   onEndStream: (bytes: Uint8Array) => void,
+  onError?: (error: Error, details: {
+    flags: number;
+    declaredBytes: number;
+    bufferedBytes: number;
+    incomingBytes: number;
+  }) => void,
 ): (incoming: Buffer) => void {
   let pending = Buffer.alloc(0);
   return (incoming: Buffer) => {
@@ -989,6 +1003,17 @@ function createConnectFrameParser(
     while (pending.length >= 5) {
       const flags = pending[0]!;
       const msgLen = pending.readUInt32BE(1);
+      if (msgLen > MAX_CONNECT_FRAME_BYTES) {
+        const details = {
+          flags,
+          declaredBytes: msgLen,
+          bufferedBytes: pending.length,
+          incomingBytes: incoming.length,
+        };
+        pending = Buffer.alloc(0);
+        onError?.(new Error(`Connect frame exceeds ${MAX_CONNECT_FRAME_BYTES} bytes`), details);
+        return;
+      }
       if (pending.length < 5 + msgLen) break;
       const messageBytes = pending.subarray(5, 5 + msgLen);
       pending = pending.subarray(5 + msgLen);
@@ -1071,6 +1096,12 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+/** Cursor emits heartbeat updates while a run is alive but not progressing. */
+export function isCursorServerHeartbeat(msg: AgentServerMessage): boolean {
+  return msg.message.case === "interactionUpdate" &&
+    msg.message.value.message.case === "heartbeat";
+}
+
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -1081,6 +1112,7 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onUnhandledExec?: (execCase: string) => void,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1095,6 +1127,7 @@ function processServerMessage(
       cloudRule,
       sendFrame,
       onMcpExec,
+      onUnhandledExec,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -1187,6 +1220,7 @@ function handleExecMessage(
   cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  onUnhandledExec?: (execCase: string) => void,
 ): void {
   const execCase = execMsg.message.case;
   if (process.env.CURSOR_PROXY_DEBUG) {
@@ -1358,6 +1392,7 @@ function handleExecMessage(
   }
 
   debugLog("exec.unhandled", { execCase, execId: execMsg.execId, execMsgId: execMsg.id });
+  onUnhandledExec?.(execCase ?? "unknown");
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1429,6 +1464,8 @@ function createBridgeStreamResponse(
   const created = Math.floor(Date.now() / 1000);
 
   let closed = false;
+  let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  let stallTimer: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
@@ -1443,8 +1480,23 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        if (stallTimer) clearInterval(stallTimer);
         controller.close();
       };
+
+      // Bun.serve idleTimeout max is 255s. Cursor H2 heartbeats do not write
+      // to this SSE response, so comment keepalives prevent the local socket
+      // from being closed during long model pauses.
+      keepaliveTimer = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+        } catch {
+          closed = true;
+          if (keepaliveTimer) clearInterval(keepaliveTimer);
+        }
+      }, 15_000);
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -1476,6 +1528,30 @@ function createBridgeStreamResponse(
         totalTokens: 0,
       };
       const tagFilter = createThinkingTagFilter();
+      let lastMeaningfulActivity = Date.now();
+      const noteMeaningfulActivity = (event: string, details: Record<string, unknown> = {}) => {
+        lastMeaningfulActivity = Date.now();
+        debugLog(event, { bridgeKey, ...details });
+      };
+      const failStream = (message: string) => {
+        if (closed) return;
+        debugLog("stream.failed", { bridgeKey, message, pendingExecs: [...execTraces.values()] });
+        sendSSE(makeChunk({ content: `\n[Error: ${message}]` }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        activeBridges.delete(bridgeKey);
+        clearInterval(heartbeatTimer);
+        bridge.kill();
+        closeController();
+      };
+
+      stallTimer = setInterval(() => {
+        const idleMs = Date.now() - lastMeaningfulActivity;
+        if (idleMs >= STREAM_STALL_TIMEOUT_MS) {
+          failStream(`Cursor stream stalled without a server message for ${Math.round(idleMs / 1000)}s`);
+        }
+      }, 5_000);
 
       let mcpExecReceived = false;
 
@@ -1486,7 +1562,15 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
-            debugLog("server.message", { bridgeKey, messageCase: serverMessage.message.case });
+            const messageCase = serverMessage.message.case;
+            const interactionCase = messageCase === "interactionUpdate"
+              ? serverMessage.message.value.message.case
+              : undefined;
+            if (isCursorServerHeartbeat(serverMessage)) {
+              debugLog("server.heartbeat", { bridgeKey });
+            } else {
+              noteMeaningfulActivity("server.message", { messageCase, interactionCase });
+            }
             if (serverMessage.message.case === "conversationCheckpointUpdate") {
               const checkpoint = serverMessage.message.value as ConversationStateStructure;
               debugLog("checkpoint.received", {
@@ -1572,16 +1656,14 @@ function createBridgeStreamResponse(
                   persistConversation(convKey, stored);
                 }
               },
+              (execCase) => failStream(`Unsupported Cursor exec request: ${execCase}`),
             );
           } catch (error) {
-            debugLog("server.message_decode_failed", {
-              bridgeKey,
-              error: error instanceof Error ? error.message : String(error),
-            });
+            failStream(`Failed to decode Cursor server message: ${error instanceof Error ? error.message : String(error)}`);
           }
         },
         (endStreamBytes) => {
-          debugLog("server.end_stream", { bridgeKey });
+          noteMeaningfulActivity("server.end_stream");
           const endError = parseConnectEndStream(endStreamBytes);
           if (process.env.CURSOR_PROXY_DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
@@ -1600,12 +1682,17 @@ function createBridgeStreamResponse(
             bridge.end();
           }
         },
+        (error, details) => {
+          debugLog("connect_frame.oversize", { bridgeKey, limitBytes: MAX_CONNECT_FRAME_BYTES, ...details });
+          failStream(error.message);
+        },
       );
 
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
+        if (stallTimer) clearInterval(stallTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1620,21 +1707,23 @@ function createBridgeStreamResponse(
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
+        } else {
+          // A paused bridge must remain alive until OpenCode returns every
+          // tool result. A clean exit here is still a lost continuation.
           // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+          sendSSE(makeChunk({ content: `\n[Error: bridge connection lost (exit ${code})]` }));
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
           activeBridges.delete(bridgeKey);
         }
       });
     },
     cancel() {
       closed = true;
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
+      if (stallTimer) clearInterval(stallTimer);
     },
   });
 
