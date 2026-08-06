@@ -37,8 +37,6 @@ import {
   ShellSuccessSchema,
   WriteResultSchema,
   WriteSuccessSchema,
-  ExecClientControlMessageSchema,
-  ExecClientStreamCloseSchema,
   type ExecServerMessage,
   type LsDirectoryTreeNode,
   type McpToolDefinition,
@@ -344,16 +342,6 @@ export function sendNativeExecResult(
           event: { case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) },
         }),
       );
-      const controlMessage = create(ExecClientControlMessageSchema, {
-        message: {
-          case: "streamClose",
-          value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
-        },
-      });
-      const clientMessage = create(AgentClientMessageSchema, {
-        message: { case: "execClientControlMessage", value: controlMessage },
-      });
-      sendMessage(toBinary(AgentClientMessageSchema, clientMessage));
       return true;
     }
 

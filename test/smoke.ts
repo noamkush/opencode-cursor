@@ -1,7 +1,7 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
   GetUsableModelsResponseSchema,
@@ -16,6 +16,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  createConnectFrameParser: typeof import("../src/proxy").createConnectFrameParser;
   isCursorServerHeartbeat: typeof import("../src/proxy").isCursorServerHeartbeat;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
@@ -220,6 +221,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    createConnectFrameParser: proxy.createConnectFrameParser,
     isCursorServerHeartbeat: proxy.isCursorServerHeartbeat,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
@@ -303,6 +305,31 @@ function testHeartbeatClassification(modules: TestModules) {
   assert(modules.isCursorServerHeartbeat(heartbeat), "Expected heartbeat to be classified as non-progress");
   assert(!modules.isCursorServerHeartbeat(text), "Expected text delta to be classified as progress");
   console.log("[test] Cursor heartbeat classification OK");
+}
+
+function testConnectFrameParserHandoff(modules: TestModules) {
+  console.log("[test] Testing Connect frame parser handoff...");
+  const message = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "heartbeat", value: create(HeartbeatUpdateSchema) },
+      }),
+    },
+  });
+  const frame = frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, message));
+  const parser = modules.createConnectFrameParser();
+  const received: Uint8Array[] = [];
+
+  parser.setHandlers((bytes) => received.push(bytes), () => {});
+  parser.process(frame.subarray(0, 3));
+  parser.setHandlers((bytes) => received.push(bytes), () => {});
+  parser.process(frame.subarray(3));
+
+  assertEqual(received.length, 1, "Expected one message after parser handoff");
+  const decoded = fromBinary(AgentServerMessageSchema, received[0]!);
+  assert(modules.isCursorServerHeartbeat(decoded), "Expected handed-off frame to decode as heartbeat");
+  console.log("[test] Connect frame parser handoff OK");
 }
 
 async function testAuthParams(modules: TestModules) {
@@ -563,6 +590,7 @@ async function main() {
   try {
     await testProxyStartStop(modules);
     testHeartbeatClassification(modules);
+    testConnectFrameParserHandoff(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
