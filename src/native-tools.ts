@@ -432,6 +432,7 @@ function normalizeListedPath(path: string, rootPath: string): string {
   if (!cleaned) return "";
   if (cleaned === ".") return rootPath || ".";
   if (cleaned.startsWith("/")) return cleaned;
+  if (cleaned === rootPath || cleaned.startsWith(`${rootPath}/`)) return cleaned;
   if (rootPath && rootPath !== ".") return joinPath(rootPath, cleaned);
   return cleaned;
 }
