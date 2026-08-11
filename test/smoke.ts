@@ -436,6 +436,10 @@ async function testCursorSystemInstructions(modules: TestModules) {
     cursorSystem[1]?.includes("Do not duplicate delegated investigation"),
     "Expected embedded duplicate-investigation instruction for Cursor",
   );
+  assert(
+    cursorSystem[1]?.includes("relative paths are relative to the Working directory"),
+    "Expected embedded apply_patch path instruction for Cursor",
+  );
 
   const otherSystem = ["Base system prompt"];
   await transform(

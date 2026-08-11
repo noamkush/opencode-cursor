@@ -33,7 +33,10 @@ the file changed, additional lines are needed, or the earlier evidence is ambigu
 searches and line ranges over full-file reads.
 
 Do not duplicate delegated investigation in the primary context. Perform direct verification only for conclusions that
-affect the final recommendation or require resolving conflicting evidence.`;
+affect the final recommendation or require resolving conflicting evidence.
+
+In apply_patch headers, relative paths are relative to the Working directory shown in the environment, not the Workspace
+root folder. Do not prefix them with the path from the workspace root to the working directory.`;
 
 /** Model map in opencode's config schema (what the `config` hook injects). */
 type ConfigProviderModels = NonNullable<
