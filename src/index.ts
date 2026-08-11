@@ -21,6 +21,20 @@ import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
+/**
+ * Additional instructions applied only to requests routed through Cursor.
+ * Keep this embedded so plugin users do not need a project-local file.
+ */
+const CURSOR_SYSTEM_INSTRUCTIONS = `For research, review, and diagnosis tasks with independent areas of investigation, delegate each area to a separate
+subagent with non-overlapping scope. Have agents return concise, evidence-backed findings rather than raw file contents.
+
+Keep a record of files, ranges, and external responses already inspected. Before rereading, reuse prior findings unless
+the file changed, additional lines are needed, or the earlier evidence is ambiguous or disputed. Prefer targeted
+searches and line ranges over full-file reads.
+
+Do not duplicate delegated investigation in the primary context. Perform direct verification only for conclusions that
+affect the final recommendation or require resolving conflicting evidence.`;
+
 /** Model map in opencode's config schema (what the `config` hook injects). */
 type ConfigProviderModels = NonNullable<
   NonNullable<Config["provider"]>[string]["models"]
@@ -154,6 +168,12 @@ export const CursorAuthPlugin: Plugin = async (
       } catch {
         // Never block opencode startup on discovery problems; the auth
         // loader still provides baseURL/fetch for any configured models.
+      }
+    },
+
+    "experimental.chat.system.transform": async (input, output) => {
+      if (input.model.providerID === CURSOR_PROVIDER_ID) {
+        output.system.push(CURSOR_SYSTEM_INSTRUCTIONS);
       }
     },
 

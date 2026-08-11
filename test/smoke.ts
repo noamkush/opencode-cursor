@@ -414,6 +414,38 @@ async function testPluginShape(modules: TestModules) {
   console.log("[test] Plugin shape OK");
 }
 
+async function testCursorSystemInstructions(modules: TestModules) {
+  console.log("[test] Testing Cursor-only system instructions...");
+  const hooks = await modules.CursorAuthPlugin({
+    client: { auth: { set: async () => {} } },
+  } as any);
+  const transform = hooks["experimental.chat.system.transform"];
+  assert(transform, "Plugin hooks missing system transform");
+
+  const cursorSystem = ["Base system prompt"];
+  await transform(
+    { model: { providerID: "cursor" } as any },
+    { system: cursorSystem },
+  );
+  assertEqual(cursorSystem.length, 2, "Expected Cursor system instructions to be appended");
+  assert(
+    cursorSystem[1]?.includes("delegate each area to a separate\nsubagent"),
+    "Expected embedded delegation instructions for Cursor",
+  );
+  assert(
+    cursorSystem[1]?.includes("Do not duplicate delegated investigation"),
+    "Expected embedded duplicate-investigation instruction for Cursor",
+  );
+
+  const otherSystem = ["Base system prompt"];
+  await transform(
+    { model: { providerID: "openai" } as any },
+    { system: otherSystem },
+  );
+  assertArrayEqual(otherSystem, ["Base system prompt"], "Expected non-Cursor system prompt unchanged");
+  console.log("[test] Cursor-only system instructions OK");
+}
+
 async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Testing array content (plan-mode) parsing...");
   const port = await modules.startProxy(async () => "test-token");
@@ -594,6 +626,7 @@ async function main() {
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
+    await testCursorSystemInstructions(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
