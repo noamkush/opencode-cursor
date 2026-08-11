@@ -22,6 +22,11 @@ you are logged in — no manual `provider` stub or model list is needed.
 OpenCode installs npm plugins automatically at startup, so users do not need
 to clone this repository.
 
+### Embedded Cursor instructions
+
+The plugin appends built-in research, review, and diagnosis workflow
+instructions to system prompts sent through the `cursor` provider.
+
 ## Authenticate
 
 ```sh
