@@ -362,12 +362,12 @@ export function sendNativeExecResult(
 }
 
 /** Reconstruct Cursor's directory tree from glob output (one path per line). */
-function buildLsResult(content: string, rootPath: string) {
-  const normalizedRoot = rootPath || ".";
+export function buildLsResult(content: string, rootPath: string) {
   const rawLines = content
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+  const normalizedRoot = lsRoot(rootPath, rawLines);
 
   const root = create(LsDirectoryTreeNodeSchema, {
     absPath: normalizedRoot,
@@ -384,8 +384,8 @@ function buildLsResult(content: string, rootPath: string) {
     const normalized = normalizeListedPath(rawLine, normalizedRoot);
     if (!normalized || normalized === normalizedRoot) continue;
     const relative =
-      normalizedRoot !== "." && normalized.startsWith(`${normalizedRoot}/`)
-        ? normalized.slice(normalizedRoot.length + 1)
+      normalizedRoot !== "." && normalized.startsWith(dirPrefix(normalizedRoot))
+        ? normalized.slice(dirPrefix(normalizedRoot).length)
         : normalized;
     const parts = relative.split("/").filter(Boolean);
     if (parts.length === 0) continue;
@@ -432,13 +432,35 @@ function normalizeListedPath(path: string, rootPath: string): string {
   if (!cleaned) return "";
   if (cleaned === ".") return rootPath || ".";
   if (cleaned.startsWith("/")) return cleaned;
+  if (cleaned === rootPath || cleaned.startsWith(`${rootPath}/`)) return cleaned;
   if (rootPath && rootPath !== ".") return joinPath(rootPath, cleaned);
   return cleaned;
 }
 
+/**
+ * Glob lists absolute paths. Splitting one under a relative root would drop
+ * its leading slash, so root the tree at the listed paths' common directory.
+ */
+function lsRoot(rootPath: string, lines: readonly string[]): string {
+  if (rootPath.startsWith("/")) return rootPath.replace(/(.)\/+$/, "$1");
+  const paths = lines.map((line) => line.replace(/\/$/, ""));
+  if (paths.length === 0 || !paths.every((path) => path.startsWith("/"))) return rootPath || ".";
+  const dirs = paths.map((path) => path.split("/").filter(Boolean).slice(0, -1));
+  const common: string[] = [];
+  for (const [index, segment] of dirs[0]!.entries()) {
+    if (!dirs.every((dir) => dir[index] === segment)) break;
+    common.push(segment);
+  }
+  return `/${common.join("/")}`;
+}
+
+function dirPrefix(dir: string): string {
+  return dir.endsWith("/") ? dir : `${dir}/`;
+}
+
 function joinPath(base: string, segment: string): string {
   if (!base || base === ".") return segment;
-  return `${base}/${segment}`;
+  return `${dirPrefix(base)}${segment}`;
 }
 
 function computeLsStats(node: LsDirectoryTreeNode): void {
