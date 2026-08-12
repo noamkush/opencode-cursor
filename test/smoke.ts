@@ -1,6 +1,9 @@
 import http from "node:http";
 import http2 from "node:http2";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
@@ -9,6 +12,10 @@ import {
   InteractionUpdateSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
+import {
+  GetEffectiveTokenLimitRequestSchema,
+  GetEffectiveTokenLimitResponseSchema,
+} from "../src/proto/aiserver_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -31,7 +38,9 @@ interface TestCursorBackend {
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   setHoldRunStream: (hold: boolean) => void;
+  setEffectiveTokenLimits: (limits: Record<string, number>) => void;
   resetObservations: () => void;
+  getEffectiveTokenLimitRequests: () => string[];
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
@@ -118,12 +127,14 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
+  let effectiveTokenLimits: Record<string, number> = {};
   const discoveryAuthHeaders: string[] = [];
   const discoveryRequestBodies: Uint8Array[] = [];
   let runStreamClosed = Promise.withResolvers<void>();
   const heldRunStreams = new Set<http2.ServerHttp2Stream>();
   let holdRunStream = false;
   const refreshAuthHeaders: string[] = [];
+  const effectiveTokenLimitRequests: string[] = [];
 
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
@@ -225,6 +236,29 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         return;
       }
 
+      if (path === "/aiserver.v1.AiService/GetEffectiveTokenLimit") {
+        const request = fromBinary(
+          GetEffectiveTokenLimitRequestSchema,
+          new Uint8Array(Buffer.concat(chunks)),
+        );
+        const modelId = request.modelDetails?.modelName ?? "";
+        effectiveTokenLimitRequests.push(modelId);
+        const tokenLimit = effectiveTokenLimits[modelId] ?? 0;
+        stream.respond({
+          ":status": 200,
+          "content-type": "application/connect+proto",
+        });
+        stream.end(
+          frameConnectUnaryMessage(
+            toBinary(
+              GetEffectiveTokenLimitResponseSchema,
+              create(GetEffectiveTokenLimitResponseSchema, { tokenLimit }),
+            ),
+          ),
+        );
+        return;
+      }
+
       stream.respond({ ":status": 404 });
       stream.end();
     });
@@ -247,11 +281,15 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         for (const stream of heldRunStreams) stream.close();
       }
     },
+    setEffectiveTokenLimits(limits) {
+      effectiveTokenLimits = { ...limits };
+    },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
       runStreamClosed = Promise.withResolvers<void>();
+      effectiveTokenLimitRequests.length = 0;
     },
     waitForRunStreamClose() {
       return runStreamClosed.promise;
@@ -261,6 +299,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getDiscoveryRequestBodies() {
       return discoveryRequestBodies.map((body) => new Uint8Array(body));
+    },
+    getEffectiveTokenLimitRequests() {
+      return [...effectiveTokenLimitRequests];
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
@@ -702,6 +743,7 @@ async function testDiscoveryFallbackAndSuccess(
     { id: "real-model-a", name: "Real Model A" },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
+  backend.setEffectiveTokenLimits({ "real-model-a": 123_456 });
   const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
   assertArrayEqual(
     Object.keys(provider.models).sort(),
@@ -716,9 +758,93 @@ async function testDiscoveryFallbackAndSuccess(
     ["auto", "real-model-a", "real-model-b"],
     "Expected proxy /v1/models to expose discovered models",
   );
+  assertEqual(
+    provider.models["real-model-a"]?.limit?.context,
+    123_456,
+    "Expected the server-provided effective token limit to be registered",
+  );
 
   modules.stopProxy();
   console.log("[test] Discovery fallback and success OK");
+}
+
+async function testModelLimitCache(modules: TestModules, backend: TestCursorBackend) {
+  console.log("[test] Testing model limit cache...");
+  const cacheDir = await mkdtemp(join(tmpdir(), "opencode-cursor-cache-"));
+  const cachePath = join(cacheDir, "opencode-cursor", "model-limits.json");
+  const freshAt = Date.now();
+  const expiredAt = freshAt - 8 * 24 * 60 * 60 * 1_000;
+  process.env.XDG_CACHE_HOME = cacheDir;
+
+  async function setCache(models: Record<string, { refreshedAt: number; limit: number }>) {
+    await mkdir(join(cacheDir, "opencode-cursor"), { recursive: true });
+    await writeFile(cachePath, JSON.stringify({ version: 1, models }));
+  }
+
+  async function waitForCachedLimit(modelId: string, limit: number) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        const cache = JSON.parse(await readFile(cachePath, "utf8"));
+        if (cache.models[modelId]?.limit === limit) return;
+      } catch {
+        // The asynchronous atomic write may not have completed yet.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Expected ${modelId} cache entry to be saved`);
+  }
+
+  try {
+    backend.setDiscoveryMode("success");
+    backend.setDiscoveredModels([{ id: "cached-model", name: "Cached Model" }]);
+    backend.setEffectiveTokenLimits({ "cached-model": 222_222 });
+    await setCache({ "cached-model": { refreshedAt: freshAt, limit: 111_111 } });
+    backend.resetObservations();
+    modules.clearModelCache();
+    const freshModels = await modules.getCursorModels("test-token");
+    assertEqual(freshModels.find((model) => model.id === "cached-model")?.contextWindow, 111_111, "Expected fresh cached limit");
+    assertArrayEqual(backend.getEffectiveTokenLimitRequests(), [], "Expected fresh cache to avoid limit RPC");
+
+    backend.setDiscoveredModels([{ id: "missing-model", name: "Missing Model" }]);
+    backend.setEffectiveTokenLimits({ "missing-model": 123_456 });
+    await setCache({});
+    backend.resetObservations();
+    modules.clearModelCache();
+    const missingModels = await modules.getCursorModels("test-token");
+    assertEqual(missingModels.find((model) => model.id === "missing-model")?.contextWindow, 123_456, "Expected missing model to resolve");
+    assertArrayEqual(backend.getEffectiveTokenLimitRequests(), ["missing-model"], "Expected missing model limit RPC");
+    await waitForCachedLimit("missing-model", 123_456);
+
+    backend.setDiscoveredModels([{ id: "expired-model", name: "Expired Model" }]);
+    backend.setEffectiveTokenLimits({ "expired-model": 234_567 });
+    await setCache({ "expired-model": { refreshedAt: expiredAt, limit: 123_456 } });
+    backend.resetObservations();
+    modules.clearModelCache();
+    const expiredModels = await modules.getCursorModels("test-token");
+    assertEqual(expiredModels.find((model) => model.id === "expired-model")?.contextWindow, 234_567, "Expected expired limit to refresh");
+    await waitForCachedLimit("expired-model", 234_567);
+
+    backend.setDiscoveredModels([{ id: "failed-model", name: "Failed Model" }]);
+    backend.setEffectiveTokenLimits({});
+    await setCache({ "failed-model": { refreshedAt: expiredAt, limit: 345_678 } });
+    backend.resetObservations();
+    modules.clearModelCache();
+    const failedModels = await modules.getCursorModels("test-token");
+    assertEqual(failedModels.find((model) => model.id === "failed-model")?.contextWindow, 345_678, "Expected failed refresh to retain cached limit");
+
+    backend.setDiscoveredModels([{ id: "corrupt-model", name: "Corrupt Model" }]);
+    backend.setEffectiveTokenLimits({ "corrupt-model": 456_789 });
+    await writeFile(cachePath, "not json");
+    backend.resetObservations();
+    modules.clearModelCache();
+    const corruptModels = await modules.getCursorModels("test-token");
+    assertEqual(corruptModels.find((model) => model.id === "corrupt-model")?.contextWindow, 456_789, "Expected corrupt cache to be ignored");
+    assertArrayEqual(backend.getEffectiveTokenLimitRequests(), ["corrupt-model"], "Expected corrupt cache to trigger limit RPC");
+  } finally {
+    delete process.env.XDG_CACHE_HOME;
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+  console.log("[test] Model limit cache OK");
 }
 
 async function main() {
@@ -740,6 +866,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testModelLimitCache(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
