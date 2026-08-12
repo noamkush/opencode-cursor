@@ -586,6 +586,10 @@ async function testCursorSystemInstructions(modules: TestModules) {
     cursorSystem[1]?.includes("Do not duplicate delegated investigation"),
     "Expected embedded duplicate-investigation instruction for Cursor",
   );
+  assert(
+    cursorSystem[1]?.includes("relative paths are relative to the Working directory"),
+    "Expected embedded apply_patch path instruction for Cursor",
+  );
 
   const otherSystem = ["Base system prompt"];
   await transform(
@@ -594,6 +598,46 @@ async function testCursorSystemInstructions(modules: TestModules) {
   );
   assertArrayEqual(otherSystem, ["Base system prompt"], "Expected non-Cursor system prompt unchanged");
   console.log("[test] Cursor-only system instructions OK");
+}
+
+
+async function testApplyPatchPathRewrite(modules: TestModules) {
+  console.log("[test] apply_patch path rewrite...");
+  const hooks = await modules.CursorAuthPlugin({
+    client: { auth: { set: async () => {} } },
+    directory: "/repo/packages/opencode",
+    worktree: "/repo",
+  } as any);
+  const before = hooks["tool.execute.before"];
+  assert(before, "Plugin hooks missing tool.execute.before");
+
+  const workspaceRelative =
+    "*** Begin Patch\n*** Update File: packages/opencode/src/foo.ts\n@@\n-a\n+b\n*** End Patch";
+
+  const output = { args: { patchText: workspaceRelative } };
+  await before({ tool: "apply_patch", sessionID: "s", callID: "c" }, output);
+  assertEqual(
+    output.args.patchText,
+    workspaceRelative,
+    "Expected missing files to be left unchanged",
+  );
+
+  const patchOutput = { args: { patchText: workspaceRelative } };
+  await before({ tool: "patch", sessionID: "s", callID: "c" }, patchOutput);
+  assertEqual(
+    patchOutput.args.patchText,
+    workspaceRelative,
+    "Expected patch tool to use the same rewrite",
+  );
+
+  const other = { args: { filePath: "packages/opencode/src/foo.ts" } };
+  await before({ tool: "read", sessionID: "s", callID: "c" }, other);
+  assertEqual(
+    other.args.filePath,
+    "packages/opencode/src/foo.ts",
+    "Expected non-patch tools to be left unchanged",
+  );
+  console.log("[test] apply_patch path rewrite OK");
 }
 
 async function testArrayContentParsing(modules: TestModules) {
@@ -863,6 +907,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testCursorSystemInstructions(modules);
+    await testApplyPatchPathRewrite(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
