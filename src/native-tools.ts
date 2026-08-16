@@ -19,6 +19,7 @@ import {
   GrepCountResultSchema,
   GrepFileCountSchema,
   GrepFileMatchSchema,
+  GrepErrorSchema,
   GrepFilesResultSchema,
   GrepResultSchema,
   GrepSuccessSchema,
@@ -498,7 +499,18 @@ function computeLsStats(node: LsDirectoryTreeNode): void {
 }
 
 /** Parse the client grep tool's text output back into Cursor's structured result. */
-function buildGrepResult(content: string, args: Record<string, string>) {
+export function buildGrepResult(content: string, args: Record<string, string>) {
+  if (content.includes("Ripgrep JSON record exceeded")) {
+    return create(GrepResultSchema, {
+      result: {
+        case: "error",
+        value: create(GrepErrorSchema, {
+          error: `${content.trim()} Retry with a more specific path or include glob.`,
+        }),
+      },
+    });
+  }
+
   const pattern = args.pattern ?? "";
   const path = args.path ?? "";
   const outputMode = args.outputMode || "content";
