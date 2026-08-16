@@ -65,6 +65,37 @@ export interface NativeRedirect {
   binding: NativeExecBinding;
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Cursor MCP glob calls use globPattern / target_directory. OpenCode's glob
+ * tool requires pattern / path. Rewrite aliases before validation.
+ */
+export function normalizeGlobArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const pattern =
+    nonEmptyString(args.pattern) ??
+    nonEmptyString(args.globPattern) ??
+    nonEmptyString(args.glob_pattern);
+  const path =
+    nonEmptyString(args.path) ??
+    nonEmptyString(args.target_directory) ??
+    nonEmptyString(args.targetDirectory);
+  if (pattern === undefined && path === undefined) return args;
+
+  const next: Record<string, unknown> = { ...args };
+  delete next.globPattern;
+  delete next.glob_pattern;
+  delete next.target_directory;
+  delete next.targetDirectory;
+  if (pattern !== undefined) next.pattern = pattern;
+  if (path !== undefined) next.path = path;
+  return next;
+}
+
 /**
  * Map a native exec request onto a client-provided OpenAI tool.
  * Returns null when no equivalent tool is available (caller rejects as before).

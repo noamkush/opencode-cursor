@@ -16,6 +16,7 @@ import {
   GetEffectiveTokenLimitRequestSchema,
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
+import { normalizeGlobArgs } from "../src/native-tools";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -270,6 +271,31 @@ async function loadModules(): Promise<TestModules> {
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
+}
+
+function testNormalizeGlobArgs() {
+  console.log("[test] normalizeGlobArgs...");
+  assertEqual(
+    JSON.stringify(normalizeGlobArgs({ globPattern: "**/*.ts" })),
+    JSON.stringify({ pattern: "**/*.ts" }),
+    "Expected globPattern to become pattern",
+  );
+  assertEqual(
+    JSON.stringify(
+      normalizeGlobArgs({
+        glob_pattern: "src/**/*.ts",
+        target_directory: "/tmp",
+      }),
+    ),
+    JSON.stringify({ pattern: "src/**/*.ts", path: "/tmp" }),
+    "Expected glob_pattern and target_directory aliases",
+  );
+  assertEqual(
+    JSON.stringify(normalizeGlobArgs({ pattern: "**/*.ts", path: "." })),
+    JSON.stringify({ pattern: "**/*.ts", path: "." }),
+    "Expected OpenCode glob args to pass through",
+  );
+  console.log("[test] normalizeGlobArgs OK");
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -750,6 +776,7 @@ async function main() {
   const modules = await loadModules();
 
   try {
+    testNormalizeGlobArgs();
     await testProxyStartStop(modules);
     testHeartbeatClassification(modules);
     testConnectFrameParserHandoff(modules);
