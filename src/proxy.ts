@@ -1365,6 +1365,7 @@ function createBridgeStreamResponse(
   const created = Math.floor(Date.now() / 1000);
 
   let closed = false;
+  let cancelStream: (() => void) | undefined;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
@@ -1376,10 +1377,26 @@ function createBridgeStreamResponse(
         if (closed) return;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
+      const stopBridge = () => {
+        if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+          activeBridges.delete(bridgeKey);
+        }
+        clearInterval(heartbeatTimer);
+        // end() only half-closes the request; killing also stops the response.
+        try { bridge.proc.kill(); } catch {}
+      };
       const closeController = () => {
         if (closed) return;
         closed = true;
         controller.close();
+      };
+      // A paused bridge closes its controller on purpose and stays registered
+      // in activeBridges for tool-result continuation. Tearing that down would
+      // break the round-trip OpenCode is about to make.
+      cancelStream = () => {
+        if (closed) return;
+        closed = true;
+        stopBridge();
       };
 
       const makeChunk = (
@@ -1503,10 +1520,8 @@ function createBridgeStreamResponse(
             sendSSE(makeChunk({}, "stop"));
             sendSSE(makeUsageChunk());
             sendDone();
+            stopBridge();
             closeController();
-            activeBridges.delete(bridgeKey);
-            clearInterval(heartbeatTimer);
-            bridge.end();
           }
         },
       );
@@ -1543,7 +1558,7 @@ function createBridgeStreamResponse(
       });
     },
     cancel() {
-      closed = true;
+      cancelStream?.();
     },
   });
 
