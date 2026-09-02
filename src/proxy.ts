@@ -73,8 +73,10 @@ import {
   normalizeEditArgs,
   normalizeFilePathArgs,
   normalizeGlobArgs,
+  normalizeWriteArgs,
   redirectNativeExec,
   sendNativeExecResult,
+  unwrapReadOutput,
   type NativeExecBinding,
 } from "./native-tools";
 import { createHash } from "node:crypto";
@@ -1286,6 +1288,7 @@ function handleExecMessage(
       decoded = normalizeFilePathArgs(decoded);
     }
     if (toolName === "edit") decoded = normalizeEditArgs(decoded);
+    if (toolName === "write") decoded = normalizeWriteArgs(decoded);
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
@@ -1913,6 +1916,7 @@ function handleToolResultResume(
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
     let text = result.content;
+    if (exec.toolName === "read") text = unwrapReadOutput(text);
     if (DEBUG) {
       debugLog("exec.result_received", {
         bridgeKey,

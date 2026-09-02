@@ -117,6 +117,43 @@ export function normalizeFilePathArgs(
   return rewriteArgAliases(args, "filePath", ["path", "filepath"], nonEmptyString);
 }
 
+const OPENCODE_READ_PREFIX = /^\d+: /;
+const CURSOR_READ_PREFIX = /^\s*\d+\|/;
+const READ_FOOTER =
+  /\n\n\((?:End of file - total \d+ lines|Showing lines .+|Output capped at .+)\)\s*$/;
+const FILE_ENVELOPE =
+  /^(?:\s*)<path>[\s\S]*?<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n<\/content>/;
+
+/** Strip Read line numbers only when every nonempty line is numbered output. */
+function stripReadLinePrefixes(text: string): string {
+  const lines = text.split("\n");
+  const nonempty = lines.filter((line) => line.length > 0);
+  if (nonempty.length === 0) return text;
+  if (nonempty.every((line) => OPENCODE_READ_PREFIX.test(line))) {
+    return lines.map((line) => line.replace(OPENCODE_READ_PREFIX, "")).join("\n");
+  }
+  if (nonempty.every((line) => CURSOR_READ_PREFIX.test(line))) {
+    return lines.map((line) => line.replace(CURSOR_READ_PREFIX, "")).join("\n");
+  }
+  return text;
+}
+
+/**
+ * Convert OpenCode Read output to plain file content. Unwraps one
+ * `<path>`, `<type>file</type>`, `<content>` envelope, drops the Read
+ * footer, then strips numbered prefixes from the inner lines.
+ */
+export function unwrapReadOutput(text: string): string {
+  const match = text.match(FILE_ENVELOPE);
+  const inner = match ? match[1]!.replace(READ_FOOTER, "") : text;
+  return stripReadLinePrefixes(inner);
+}
+
+function asReadText(value: unknown): string | undefined {
+  const text = asString(value);
+  return text === undefined ? undefined : unwrapReadOutput(text);
+}
+
 /**
  * Cursor edit/StrReplace calls use old_string / new_string / replace_all.
  * OpenCode's edit tool requires oldString / newString / replaceAll.
@@ -124,9 +161,16 @@ export function normalizeFilePathArgs(
 export function normalizeEditArgs(
   args: Record<string, unknown>,
 ): Record<string, unknown> {
-  args = rewriteArgAliases(args, "oldString", ["old_string"], asString);
-  args = rewriteArgAliases(args, "newString", ["new_string"], asString);
+  args = rewriteArgAliases(args, "oldString", ["old_string"], asReadText);
+  args = rewriteArgAliases(args, "newString", ["new_string"], asReadText);
   return rewriteArgAliases(args, "replaceAll", ["replace_all"], asBoolean);
+}
+
+/** Strip a copied Read envelope from write content before the file is written. */
+export function normalizeWriteArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  return rewriteArgAliases(args, "content", [], asReadText);
 }
 
 /**
@@ -160,10 +204,11 @@ export function redirectNativeExec(
     const args = execMsg.message.value;
     const toolName = pick(["write"]);
     if (!toolName) return null;
-    const content =
+    const content = unwrapReadOutput(
       args.fileBytes && args.fileBytes.length > 0
         ? new TextDecoder().decode(args.fileBytes)
-        : (args.fileText ?? "");
+        : (args.fileText ?? ""),
+    );
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,

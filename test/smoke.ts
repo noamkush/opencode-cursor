@@ -16,7 +16,7 @@ import {
   GetEffectiveTokenLimitRequestSchema,
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
-import { normalizeEditArgs, normalizeFilePathArgs, normalizeGlobArgs } from "../src/native-tools";
+import { normalizeEditArgs, normalizeFilePathArgs, normalizeGlobArgs, normalizeWriteArgs, unwrapReadOutput } from "../src/native-tools";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -389,6 +389,82 @@ function testNormalizeFilePathArgs() {
   console.log("[test] normalizeFilePathArgs OK");
 }
 
+function opencodeReadOutput(path: string, lines: readonly string[], footer: string): string {
+  return [
+    `<path>${path}</path>`,
+    "<type>file</type>",
+    "<content>",
+    ...lines.map((line, index) => `${index + 1}: ${line}`),
+    "",
+    footer,
+    "</content>",
+  ].join("\n");
+}
+
+function testUnwrapReadOutput() {
+  console.log("[test] unwrapReadOutput...");
+  const lines = ["import abc", "import logging"];
+  const envelope = opencodeReadOutput(
+    "/tmp/a.py",
+    lines,
+    "(End of file - total 2 lines)",
+  );
+  assertEqual(
+    unwrapReadOutput(envelope),
+    lines.join("\n"),
+    "Expected a file envelope to unwrap to raw content",
+  );
+
+  const nested = opencodeReadOutput(
+    "/tmp/a.py",
+    envelope.split("\n"),
+    "(End of file - total 8 lines)",
+  );
+  assertEqual(
+    unwrapReadOutput(nested),
+    envelope,
+    "Expected a nested envelope to unwrap one layer",
+  );
+
+  assertEqual(
+    unwrapReadOutput("plain text"),
+    "plain text",
+    "Expected non-envelope text to pass through",
+  );
+  assertEqual(
+    unwrapReadOutput(["12: const x = 1", "13: const y = 2"].join("\n")),
+    ["const x = 1", "const y = 2"].join("\n"),
+    "Expected numbered Read lines without an envelope to be stripped",
+  );
+  assertEqual(
+    unwrapReadOutput(["  12|foo", "  13|bar"].join("\n")),
+    ["foo", "bar"].join("\n"),
+    "Expected Cursor Read prefixes to be stripped",
+  );
+  assertEqual(
+    unwrapReadOutput(["1: still real content", "const x = 1"].join("\n")),
+    ["1: still real content", "const x = 1"].join("\n"),
+    "Expected mixed lines to keep Read-like prefixes",
+  );
+  assertEqual(
+    unwrapReadOutput(
+      opencodeReadOutput(
+        "/tmp/a.py",
+        lines,
+        "(Showing lines 1-2 of 10. Use offset=3 to continue.)",
+      ),
+    ),
+    lines.join("\n"),
+    "Expected truncation footer to be dropped",
+  );
+  assertEqual(
+    unwrapReadOutput(`${envelope}\n\n<system-reminder>\nnote\n</system-reminder>`),
+    lines.join("\n"),
+    "Expected system-reminder after the envelope to be dropped",
+  );
+  console.log("[test] unwrapReadOutput OK");
+}
+
 function testNormalizeEditArgs() {
   console.log("[test] normalizeEditArgs...");
   assertEqual(
@@ -420,7 +496,38 @@ function testNormalizeEditArgs() {
     JSON.stringify({ oldString: "keep", newString: "next" }),
     "Expected existing camelCase edit args to win",
   );
+  assertEqual(
+    JSON.stringify(
+      normalizeEditArgs({
+        old_string: opencodeReadOutput("/tmp/a.ts", ["before"], "(End of file - total 1 lines)"),
+        new_string: opencodeReadOutput("/tmp/a.ts", ["after"], "(End of file - total 1 lines)"),
+      }),
+    ),
+    JSON.stringify({ oldString: "before", newString: "after" }),
+    "Expected edit args copied from Read output to unwrap",
+  );
   console.log("[test] normalizeEditArgs OK");
+}
+
+function testNormalizeWriteArgs() {
+  console.log("[test] normalizeWriteArgs...");
+  const content = ["import abc", "import logging"].join("\n");
+  assertEqual(
+    JSON.stringify(
+      normalizeWriteArgs({
+        filePath: "/tmp/a.py",
+        content: opencodeReadOutput("/tmp/a.py", content.split("\n"), "(End of file - total 2 lines)"),
+      }),
+    ),
+    JSON.stringify({ filePath: "/tmp/a.py", content }),
+    "Expected write content envelopes to unwrap",
+  );
+  assertEqual(
+    JSON.stringify(normalizeWriteArgs({ filePath: "/tmp/a.py", content })),
+    JSON.stringify({ filePath: "/tmp/a.py", content }),
+    "Expected plain write content to pass through",
+  );
+  console.log("[test] normalizeWriteArgs OK");
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -986,7 +1093,9 @@ async function main() {
   try {
     testNormalizeGlobArgs();
     testNormalizeFilePathArgs();
+    testUnwrapReadOutput();
     testNormalizeEditArgs();
+    testNormalizeWriteArgs();
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
     testHeartbeatClassification(modules);
