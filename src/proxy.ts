@@ -70,6 +70,9 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import {
+  normalizeEditArgs,
+  normalizeFilePathArgs,
+  normalizeGlobArgs,
   redirectNativeExec,
   sendNativeExecResult,
   type NativeExecBinding,
@@ -1276,12 +1279,18 @@ function handleExecMessage(
 
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
-    const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const toolName = mcpArgs.toolName || mcpArgs.name;
+    let decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    if (toolName === "glob") decoded = normalizeGlobArgs(decoded);
+    if (toolName === "read" || toolName === "edit" || toolName === "write" || toolName === "lsp") {
+      decoded = normalizeFilePathArgs(decoded);
+    }
+    if (toolName === "edit") decoded = normalizeEditArgs(decoded);
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
-      toolName: mcpArgs.toolName || mcpArgs.name,
+      toolName,
       decodedArgs: JSON.stringify(decoded),
     });
     return;

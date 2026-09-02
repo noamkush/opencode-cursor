@@ -66,6 +66,69 @@ export interface NativeRedirect {
   binding: NativeExecBinding;
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/** Pick the first matching canonical/alias value, drop aliases, set the canonical key. */
+function rewriteArgAliases(
+  args: Record<string, unknown>,
+  key: string,
+  aliases: readonly string[],
+  pick: (value: unknown) => unknown,
+): Record<string, unknown> {
+  const value = [key, ...aliases]
+    .map((name) => pick(args[name]))
+    .find((candidate) => candidate !== undefined);
+  if (value === undefined) return args;
+
+  const next: Record<string, unknown> = { ...args };
+  for (const alias of aliases) delete next[alias];
+  next[key] = value;
+  return next;
+}
+
+/**
+ * Cursor MCP glob calls use globPattern / target_directory. OpenCode's glob
+ * tool requires pattern / path. Rewrite aliases before validation.
+ */
+export function normalizeGlobArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  args = rewriteArgAliases(args, "pattern", ["globPattern", "glob_pattern"], nonEmptyString);
+  return rewriteArgAliases(args, "path", ["target_directory", "targetDirectory"], nonEmptyString);
+}
+
+/**
+ * Cursor native tools use `path`. OpenCode's read/edit/write/lsp tools
+ * require `filePath`. Copy aliases before schema validation.
+ */
+export function normalizeFilePathArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  return rewriteArgAliases(args, "filePath", ["path", "filepath"], nonEmptyString);
+}
+
+/**
+ * Cursor edit/StrReplace calls use old_string / new_string / replace_all.
+ * OpenCode's edit tool requires oldString / newString / replaceAll.
+ */
+export function normalizeEditArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  args = rewriteArgAliases(args, "oldString", ["old_string"], asString);
+  args = rewriteArgAliases(args, "newString", ["new_string"], asString);
+  return rewriteArgAliases(args, "replaceAll", ["replace_all"], asBoolean);
+}
+
 /**
  * Map a native exec request onto a client-provided OpenAI tool.
  * Returns null when no equivalent tool is available (caller rejects as before).

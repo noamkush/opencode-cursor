@@ -16,6 +16,7 @@ import {
   GetEffectiveTokenLimitRequestSchema,
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
+import { normalizeEditArgs, normalizeFilePathArgs, normalizeGlobArgs } from "../src/native-tools";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -336,6 +337,90 @@ async function loadModules(): Promise<TestModules> {
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
+}
+
+function testNormalizeGlobArgs() {
+  console.log("[test] normalizeGlobArgs...");
+  assertEqual(
+    JSON.stringify(normalizeGlobArgs({ globPattern: "**/*.ts" })),
+    JSON.stringify({ pattern: "**/*.ts" }),
+    "Expected globPattern to become pattern",
+  );
+  assertEqual(
+    JSON.stringify(
+      normalizeGlobArgs({
+        glob_pattern: "src/**/*.ts",
+        target_directory: "/tmp",
+      }),
+    ),
+    JSON.stringify({ pattern: "src/**/*.ts", path: "/tmp" }),
+    "Expected glob_pattern and target_directory aliases",
+  );
+  assertEqual(
+    JSON.stringify(normalizeGlobArgs({ pattern: "**/*.ts", path: "." })),
+    JSON.stringify({ pattern: "**/*.ts", path: "." }),
+    "Expected OpenCode glob args to pass through",
+  );
+  console.log("[test] normalizeGlobArgs OK");
+}
+
+function testNormalizeFilePathArgs() {
+  console.log("[test] normalizeFilePathArgs...");
+  assertEqual(
+    JSON.stringify(normalizeFilePathArgs({ path: "/tmp/a.ts", limit: 80 })),
+    JSON.stringify({ limit: 80, filePath: "/tmp/a.ts" }),
+    "Expected path and limit to become filePath",
+  );
+  assertEqual(
+    JSON.stringify(normalizeFilePathArgs({ filepath: "/tmp/b.ts" })),
+    JSON.stringify({ filePath: "/tmp/b.ts" }),
+    "Expected filepath alias to become filePath",
+  );
+  assertEqual(
+    JSON.stringify(normalizeFilePathArgs({ filePath: "/tmp/c.ts" })),
+    JSON.stringify({ filePath: "/tmp/c.ts" }),
+    "Expected OpenCode filePath args to pass through",
+  );
+  assertEqual(
+    JSON.stringify(normalizeFilePathArgs({ filePath: "/tmp/keep.ts", path: "/tmp/drop.ts" })),
+    JSON.stringify({ filePath: "/tmp/keep.ts" }),
+    "Expected existing filePath to win over path",
+  );
+  console.log("[test] normalizeFilePathArgs OK");
+}
+
+function testNormalizeEditArgs() {
+  console.log("[test] normalizeEditArgs...");
+  assertEqual(
+    JSON.stringify(
+      normalizeEditArgs({
+        filePath: "/tmp/a.ts",
+        old_string: "before",
+        new_string: "after",
+        replace_all: true,
+      }),
+    ),
+    JSON.stringify({
+      filePath: "/tmp/a.ts",
+      oldString: "before",
+      newString: "after",
+      replaceAll: true,
+    }),
+    "Expected snake_case edit args to become camelCase",
+  );
+  assertEqual(
+    JSON.stringify(
+      normalizeEditArgs({
+        oldString: "keep",
+        newString: "next",
+        old_string: "drop",
+        new_string: "drop",
+      }),
+    ),
+    JSON.stringify({ oldString: "keep", newString: "next" }),
+    "Expected existing camelCase edit args to win",
+  );
+  console.log("[test] normalizeEditArgs OK");
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -899,6 +984,9 @@ async function main() {
   const modules = await loadModules();
 
   try {
+    testNormalizeGlobArgs();
+    testNormalizeFilePathArgs();
+    testNormalizeEditArgs();
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
     testHeartbeatClassification(modules);
