@@ -8,7 +8,8 @@
  * OpenAI tool, redirect the native call to it and convert the tool result
  * back into Cursor's typed native result frame.
  */
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
+import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
   ExecClientMessageSchema,
@@ -65,6 +66,86 @@ export interface NativeRedirect {
   binding: NativeExecBinding;
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/** Pick the first matching canonical/alias value, drop aliases, set the canonical key. */
+function rewriteArgAliases(
+  args: Record<string, unknown>,
+  key: string,
+  aliases: readonly string[],
+  pick: (value: unknown) => unknown,
+): Record<string, unknown> {
+  const value = [key, ...aliases]
+    .map((name) => pick(args[name]))
+    .find((candidate) => candidate !== undefined);
+  if (value === undefined) return args;
+
+  const next: Record<string, unknown> = { ...args };
+  for (const alias of aliases) delete next[alias];
+  next[key] = value;
+  return next;
+}
+
+function inputProperties(tool: McpToolDefinition | undefined): Record<string, unknown> {
+  if (!tool?.inputSchema.length) return {};
+  try {
+    const schema = toJson(ValueSchema, fromBinary(ValueSchema, tool.inputSchema));
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return {};
+    const properties = schema.properties;
+    return properties && typeof properties === "object" && !Array.isArray(properties) ? properties : {};
+  } catch {
+    return {};
+  }
+}
+
+export function filePathKey(tool: McpToolDefinition | undefined): "path" | "filePath" | undefined {
+  const properties = inputProperties(tool);
+  // An ambiguous or missing schema is not permission to rename arguments.
+  if (Object.hasOwn(properties, "path") === Object.hasOwn(properties, "filePath")) return undefined;
+  return Object.hasOwn(properties, "path") ? "path" : "filePath";
+}
+
+/**
+ * Cursor calls use native param names (path, globPattern, old_string, ...).
+ * Normalize only aliases whose canonical field is actually advertised.
+ */
+export function normalizeToolArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+  tools: readonly McpToolDefinition[],
+): Record<string, unknown> {
+  const tool = tools.find((tool) => (tool.name || tool.toolName) === toolName);
+  const properties = inputProperties(tool);
+  if (["read", "edit", "write", "lsp"].includes(toolName)) {
+    const key = filePathKey(tool);
+    if (key) args = rewriteArgAliases(args, key, ["path", "filePath", "filepath"].filter((alias) => alias !== key && !Object.hasOwn(properties, alias)), nonEmptyString);
+  }
+  if (toolName === "glob") {
+    if (Object.hasOwn(properties, "pattern")) args = rewriteArgAliases(args, "pattern", ["globPattern", "glob_pattern"].filter((key) => !Object.hasOwn(properties, key)), nonEmptyString);
+    if (Object.hasOwn(properties, "path")) args = rewriteArgAliases(args, "path", ["target_directory", "targetDirectory"].filter((key) => !Object.hasOwn(properties, key)), nonEmptyString);
+  }
+  if (toolName === "edit") {
+    for (const [key, alias, pick] of [
+      ["oldString", "old_string", asString],
+      ["newString", "new_string", asString],
+      ["replaceAll", "replace_all", asBoolean],
+    ] as const) {
+      if (Object.hasOwn(properties, key) && !Object.hasOwn(properties, alias)) args = rewriteArgAliases(args, key, [alias], pick);
+    }
+  }
+  return args;
+}
+
 /**
  * Map a native exec request onto a client-provided OpenAI tool.
  * Returns null when no equivalent tool is available (caller rejects as before).
@@ -84,10 +165,12 @@ export function redirectNativeExec(
     const args = execMsg.message.value;
     const toolName = pick(["read"]);
     if (!toolName) return null;
+    const key = filePathKey(mcpTools.find((tool) => (tool.name || tool.toolName) === toolName));
+    if (!key) return null;
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
-      decodedArgs: JSON.stringify({ filePath: args.path ?? "" }),
+      decodedArgs: JSON.stringify({ [key]: args.path ?? "" }),
       binding: { resultType: "readResult", args: { path: args.path ?? "" } },
     };
   }
@@ -96,6 +179,8 @@ export function redirectNativeExec(
     const args = execMsg.message.value;
     const toolName = pick(["write"]);
     if (!toolName) return null;
+    const key = filePathKey(mcpTools.find((tool) => (tool.name || tool.toolName) === toolName));
+    if (!key) return null;
     const content =
       args.fileBytes && args.fileBytes.length > 0
         ? new TextDecoder().decode(args.fileBytes)
@@ -103,7 +188,7 @@ export function redirectNativeExec(
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
-      decodedArgs: JSON.stringify({ filePath: args.path ?? "", content }),
+      decodedArgs: JSON.stringify({ [key]: args.path ?? "", content }),
       binding: {
         resultType: "writeResult",
         args: {

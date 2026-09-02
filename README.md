@@ -53,6 +53,12 @@ OpenCode V1 and OpenCode V2 add the `cursor` provider and its models.
 OpenCode installs npm plugins during startup.
 You do not have to clone this repository.
 
+### Tool compatibility
+
+Cursor's tool-argument names are renamed to the names each OpenCode tool
+advertises (`filePath` in OpenCode V1, `path` in V2), and only when that name
+is unambiguous. Write and edit content is passed through literally.
+
 ## Use
 
 Start OpenCode and select any Cursor model. The plugin starts a local
