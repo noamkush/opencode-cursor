@@ -70,6 +70,7 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import {
+  normalizeToolArgs,
   redirectNativeExec,
   sendNativeExecResult,
   type NativeExecBinding,
@@ -164,7 +165,7 @@ interface CursorRequestPayload {
 }
 
 /** A pending tool execution waiting for results from the caller. */
-interface PendingExec {
+export interface PendingExec {
   execId: string;
   execMsgId: number;
   toolCallId: string;
@@ -1237,7 +1238,7 @@ function handleKvMessage(
   }
 }
 
-function handleExecMessage(
+export function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
   cloudRule: string | undefined,
@@ -1276,12 +1277,13 @@ function handleExecMessage(
 
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
-    const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const toolName = mcpArgs.toolName || mcpArgs.name;
+    const decoded = normalizeToolArgs(toolName, decodeMcpArgsMap(mcpArgs.args ?? {}), mcpTools);
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
-      toolName: mcpArgs.toolName || mcpArgs.name,
+      toolName,
       decodedArgs: JSON.stringify(decoded),
     });
     return;
