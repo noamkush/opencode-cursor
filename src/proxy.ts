@@ -187,6 +187,8 @@ interface ActiveBridge {
   cloudRule?: string;
   pendingExecs: PendingExec[];
   queuedExecs: PendingExec[];
+  /** Latest Cursor conversation occupancy (`used_tokens`). */
+  totalTokens: number;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -1114,11 +1116,31 @@ interface StreamState {
   totalTokens: number;
 }
 
+function occupancyFromCheckpoint(checkpoint: Uint8Array | null | undefined): number {
+  if (!checkpoint?.length) return 0;
+  try {
+    return fromBinary(ConversationStateStructureSchema, checkpoint).tokenDetails?.usedTokens ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 function computeUsage(state: StreamState) {
-  const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
-  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
-  return { prompt_tokens, completion_tokens, total_tokens };
+  const output = state.outputTokens;
+  const total_tokens = state.totalTokens || output;
+  // OpenCode's context bar only uses the last assistant message with output > 0.
+  if (total_tokens > 0 && output === 0) {
+    return {
+      prompt_tokens: Math.max(0, total_tokens - 1),
+      completion_tokens: 1,
+      total_tokens,
+    };
+  }
+  return {
+    prompt_tokens: Math.max(0, total_tokens - output),
+    completion_tokens: output,
+    total_tokens,
+  };
 }
 
 /** Cursor emits heartbeat updates while a run is alive but not progressing. */
@@ -1519,6 +1541,7 @@ function createBridgeStreamResponse(
   convKey: string,
   frameParser = createConnectFrameParser(),
   initialExecs: PendingExec[] = [],
+  initialTotalTokens = 0,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1608,7 +1631,7 @@ function createBridgeStreamResponse(
         toolCallIndex: 0,
         pendingExecs: [],
         outputTokens: 0,
-        totalTokens: 0,
+        totalTokens: initialTotalTokens,
       };
       const tagFilter = createThinkingTagFilter();
       let lastMeaningfulActivity = Date.now();
@@ -1681,12 +1704,14 @@ function createBridgeStreamResponse(
           cloudRule,
           pendingExecs: state.pendingExecs,
           queuedExecs,
+          totalTokens: state.totalTokens,
         });
 
         if (toolBatchTimer) clearTimeout(toolBatchTimer);
         toolBatchTimer = setTimeout(() => {
           toolBatchTimer = undefined;
           sendSSE(makeChunk({}, "tool_calls"));
+          sendSSE(makeUsageChunk());
           sendDone();
           closeController();
         }, TOOL_BATCH_QUIET_MS);
@@ -1760,6 +1785,8 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
+                const active = activeBridges.get(bridgeKey);
+                if (active) active.totalTokens = state.totalTokens;
               },
               (execCase) => failStream(`Unsupported Cursor exec request: ${execCase}`),
             );
@@ -1856,6 +1883,9 @@ function handleStreamingResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools, payload.cloudRule,
     modelId, bridgeKey, convKey,
+    createConnectFrameParser(),
+    [],
+    occupancyFromCheckpoint(conversationStates.get(convKey)?.checkpoint),
   );
 }
 
@@ -1893,6 +1923,7 @@ function handleToolResultResume(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
     modelId, bridgeKey, convKey, frameParser, initialExecs,
+    active.totalTokens,
   );
 
   // Answer each pending exec with a matching tool result: redirected native
@@ -2046,7 +2077,7 @@ async function collectFullResponse(
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
-    totalTokens: 0,
+    totalTokens: occupancyFromCheckpoint(conversationStates.get(convKey)?.checkpoint),
   };
   const tagFilter = createThinkingTagFilter();
 
