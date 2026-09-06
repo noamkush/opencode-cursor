@@ -7,10 +7,15 @@ import { join } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
+  ConversationStateStructureSchema,
+  ConversationTokenDetailsSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
+  type AgentServerMessage,
 } from "../src/proto/agent_pb";
 import {
   GetEffectiveTokenLimitRequestSchema,
@@ -39,6 +44,9 @@ interface TestCursorBackend {
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   setHoldRunStream: (hold: boolean) => void;
+  setRunFrames: (frames: Buffer[]) => void;
+  writeRunFrames: (frames: Buffer[]) => void;
+  endRunStreams: () => void;
   setEffectiveTokenLimits: (limits: Record<string, number>) => void;
   resetObservations: () => void;
   getEffectiveTokenLimitRequests: () => string[];
@@ -108,19 +116,88 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
 
 /** A Connect-framed text delta, enough to make the proxy emit its first SSE chunk. */
 function frameRunTextDelta(text: string): Buffer {
-  return frameConnectUnaryMessage(
-    toBinary(
-      AgentServerMessageSchema,
-      create(AgentServerMessageSchema, {
-        message: {
-          case: "interactionUpdate",
-          value: create(InteractionUpdateSchema, {
-            message: { case: "textDelta", value: { text } },
-          }),
-        },
-      }),
-    ),
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: { case: "textDelta", value: { text } },
+        }),
+      },
+    }),
   );
+}
+
+function frameAgentMessage(message: AgentServerMessage): Buffer {
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, message));
+}
+
+function frameCheckpoint(usedTokens: number, maxTokens = 256_000): Buffer {
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "conversationCheckpointUpdate",
+        value: create(ConversationStateStructureSchema, {
+          tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens, maxTokens }),
+        }),
+      },
+    }),
+  );
+}
+
+function frameTokenDelta(tokens: number): Buffer {
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: { case: "tokenDelta", value: { tokens } },
+        }),
+      },
+    }),
+  );
+}
+
+function frameMcpExec(toolCallId: string, toolName = "read"): Buffer {
+  return frameAgentMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "execServerMessage",
+        value: create(ExecServerMessageSchema, {
+          id: 1,
+          execId: "exec-1",
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: toolName,
+              toolName,
+              toolCallId,
+            }),
+          },
+        }),
+      },
+    }),
+  );
+}
+
+async function collectSseEvents(res: Response): Promise<any[]> {
+  const text = await res.text();
+  const events: any[] = [];
+  for (const block of text.split("\n\n")) {
+    const line = block.split("\n").find((item) => item.startsWith("data: "));
+    if (!line) continue;
+    const data = line.slice(6).trim();
+    if (!data || data === "[DONE]") continue;
+    events.push(JSON.parse(data));
+  }
+  return events;
+}
+
+function lastUsage(events: any[]): { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]?.usage) return events[i].usage;
+  }
+  return undefined;
 }
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
@@ -134,6 +211,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let runStreamClosed = Promise.withResolvers<void>();
   const heldRunStreams = new Set<http2.ServerHttp2Stream>();
   let holdRunStream = false;
+  let runFrames: Buffer[] | null = null;
   const refreshAuthHeaders: string[] = [];
   const effectiveTokenLimitRequests: string[] = [];
 
@@ -178,12 +256,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         heldRunStreams.delete(stream);
         closed.resolve();
       });
-      if (holdRunStream) {
+      if (runFrames) {
+        for (const frame of runFrames) stream.write(frame);
+      } else if (holdRunStream) {
         // Cancellation can only be observed on a stream still running when the
         // client goes away. Bun also withholds SSE response headers until the
         // first body byte, so emit one to unblock the caller's fetch.
-        heldRunStreams.add(stream);
         stream.write(frameRunTextDelta("streaming"));
+      }
+      if (holdRunStream) {
+        heldRunStreams.add(stream);
       } else {
         stream.end();
       }
@@ -282,6 +364,17 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         for (const stream of heldRunStreams) stream.close();
       }
     },
+    setRunFrames(frames) {
+      runFrames = frames;
+    },
+    writeRunFrames(frames) {
+      for (const stream of heldRunStreams) {
+        for (const frame of frames) stream.write(frame);
+      }
+    },
+    endRunStreams() {
+      for (const stream of heldRunStreams) stream.end();
+    },
     setEffectiveTokenLimits(limits) {
       effectiveTokenLimits = { ...limits };
     },
@@ -291,6 +384,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       refreshAuthHeaders.length = 0;
       runStreamClosed = Promise.withResolvers<void>();
       effectiveTokenLimitRequests.length = 0;
+      runFrames = null;
     },
     waitForRunStreamClose() {
       return runStreamClosed.promise;
@@ -1083,6 +1177,98 @@ async function testModelLimitCache(modules: TestModules, backend: TestCursorBack
   console.log("[test] Model limit cache OK");
 }
 
+
+async function postChat(port: number, body: Record<string, unknown>): Promise<Response> {
+  return fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function testUsageFromCheckpointAndTokenDelta(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing occupancy usage on stop...");
+  backend.resetObservations();
+  backend.setHoldRunStream(false);
+  backend.setRunFrames([frameCheckpoint(10_000), frameTokenDelta(100)]);
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const res = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "occupancy-stop-usage" }],
+    });
+    assertEqual(res.status, 200, "Expected streaming completion");
+    const usage = lastUsage(await collectSseEvents(res));
+    assert(usage, "Expected a usage chunk");
+    assertEqual(usage.prompt_tokens, 9_900, "Expected occupancy minus output");
+    assertEqual(usage.completion_tokens, 100, "Expected summed token deltas");
+    assertEqual(usage.total_tokens, 10_000, "Expected checkpoint used_tokens");
+  } finally {
+    modules.stopProxy();
+    backend.resetObservations();
+  }
+  console.log("[test] Occupancy usage on stop OK");
+}
+
+async function testUsageOnToolCallsAndResume(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing occupancy usage on tool calls and resume...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunFrames([frameCheckpoint(10_000), frameMcpExec("call-occupancy")]);
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "occupancy-tool-usage" }],
+    });
+    assertEqual(first.status, 200, "Expected streaming tool-call completion");
+    const firstUsage = lastUsage(await collectSseEvents(first));
+    assert(firstUsage, "Expected usage on tool_calls finish");
+    assertEqual(firstUsage.prompt_tokens, 9_999, "Expected occupancy with placeholder output");
+    assertEqual(firstUsage.completion_tokens, 1, "Expected placeholder output so OpenCode shows context");
+    assertEqual(firstUsage.total_tokens, 10_000, "Expected checkpoint used_tokens on tool_calls");
+
+    const second = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [
+        { role: "user", content: "occupancy-tool-usage" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call-occupancy",
+            type: "function",
+            function: { name: "read", arguments: "{}" },
+          }],
+        },
+        { role: "tool", tool_call_id: "call-occupancy", content: "ok" },
+      ],
+    });
+    assertEqual(second.status, 200, "Expected resumed streaming completion");
+    backend.writeRunFrames([frameTokenDelta(50)]);
+    backend.endRunStreams();
+    const secondUsage = lastUsage(await collectSseEvents(second));
+    assert(secondUsage, "Expected usage after resume");
+    assertEqual(secondUsage.prompt_tokens, 9_950, "Expected occupancy minus new output");
+    assertEqual(secondUsage.completion_tokens, 50, "Expected resume token deltas");
+    assertEqual(secondUsage.total_tokens, 10_000, "Expected occupancy to survive resume without a new checkpoint");
+  } finally {
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+    backend.resetObservations();
+  }
+  console.log("[test] Occupancy usage on tool calls and resume OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1109,6 +1295,8 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testModelLimitCache(modules, backend);
+    await testUsageFromCheckpointAndTokenDelta(modules, backend);
+    await testUsageOnToolCallsAndResume(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
