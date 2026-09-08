@@ -27,8 +27,11 @@ import {
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
+  ComputerUseErrorSchema,
+  ComputerUseResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
+  DiagnosticsRejectedSchema,
   DiagnosticsResultSchema,
   ExecClientControlMessageSchema,
   ExecClientMessageSchema,
@@ -41,6 +44,9 @@ import {
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
+  ListMcpResourcesExecResultSchema,
+  ListMcpResourcesRejectedSchema,
+  McpErrorSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -49,6 +55,10 @@ import {
   ModelDetailsSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  ReadMcpResourceExecResultSchema,
+  ReadMcpResourceRejectedSchema,
+  RecordScreenFailureSchema,
+  RecordScreenResultSchema,
   RequestContextResultSchema,
   RequestedModelSchema,
   RequestContextSchema,
@@ -1448,22 +1458,9 @@ function handleExecMessage(
     sendExecResult(execMsg, "fetchResult", result, sendFrame);
     return;
   }
-  if (execCase === "diagnosticsArgs") {
-    const result = create(DiagnosticsResultSchema, {});
-    sendExecResult(execMsg, "diagnosticsResult", result, sendFrame);
-    return;
-  }
-
-  // MCP resource/screen/computer exec types
-  const miscCaseMap: Record<string, string> = {
-    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-    readMcpResourceExecArgs: "readMcpResourceExecResult",
-    recordScreenArgs: "recordScreenResult",
-    computerUseArgs: "computerUseResult",
-  };
-  const resultCase = miscCaseMap[execCase as string];
-  if (resultCase) {
-    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
+  const unavailable = buildUnavailableExecResult(execMsg, REJECT_REASON);
+  if (unavailable) {
+    sendExecResult(execMsg, unavailable.messageCase, unavailable.value, sendFrame);
     return;
   }
 
@@ -1488,6 +1485,77 @@ export function describeUnknownExecFields(
     wireType: field.wireType,
     encodedBytes: field.data.length,
   }));
+}
+
+/** Build valid typed failures for known execs this proxy cannot provide. */
+export function buildUnavailableExecResult(
+  execMsg: ExecServerMessage,
+  reason = "Tool not available in this environment.",
+): { messageCase: string; value: unknown } | null {
+  switch (execMsg.message.case) {
+    case "diagnosticsArgs":
+      return {
+        messageCase: "diagnosticsResult",
+        value: create(DiagnosticsResultSchema, {
+          result: {
+            case: "rejected",
+            value: create(DiagnosticsRejectedSchema, {
+              path: execMsg.message.value.path,
+              reason,
+            }),
+          },
+        }),
+      };
+    case "listMcpResourcesExecArgs":
+      return {
+        messageCase: "listMcpResourcesExecResult",
+        value: create(ListMcpResourcesExecResultSchema, {
+          result: {
+            case: "rejected",
+            value: create(ListMcpResourcesRejectedSchema, { reason }),
+          },
+        }),
+      };
+    case "readMcpResourceExecArgs":
+      return {
+        messageCase: "readMcpResourceExecResult",
+        value: create(ReadMcpResourceExecResultSchema, {
+          result: {
+            case: "rejected",
+            value: create(ReadMcpResourceRejectedSchema, {
+              uri: execMsg.message.value.uri,
+              reason,
+            }),
+          },
+        }),
+      };
+    case "recordScreenArgs":
+      return {
+        messageCase: "recordScreenResult",
+        value: create(RecordScreenResultSchema, {
+          result: {
+            case: "failure",
+            value: create(RecordScreenFailureSchema, { error: reason }),
+          },
+        }),
+      };
+    case "computerUseArgs":
+      return {
+        messageCase: "computerUseResult",
+        value: create(ComputerUseResultSchema, {
+          result: {
+            case: "error",
+            value: create(ComputerUseErrorSchema, {
+              error: reason,
+              actionCount: 0,
+              durationMs: 0,
+            }),
+          },
+        }),
+      };
+    default:
+      return null;
+  }
 }
 
 /** Send an exec client message back to Cursor. */

@@ -158,14 +158,14 @@ function frameTokenDelta(tokens: number): Buffer {
   );
 }
 
-function frameMcpExec(toolCallId: string, toolName = "read"): Buffer {
+function frameMcpExec(toolCallId: string, toolName = "read", id = 1): Buffer {
   return frameAgentMessage(
     create(AgentServerMessageSchema, {
       message: {
         case: "execServerMessage",
         value: create(ExecServerMessageSchema, {
-          id: 1,
-          execId: "exec-1",
+          id,
+          execId: `exec-${id}`,
           message: {
             case: "mcpArgs",
             value: create(McpArgsSchema, {
@@ -1269,6 +1269,61 @@ async function testUsageOnToolCallsAndResume(
   console.log("[test] Occupancy usage on tool calls and resume OK");
 }
 
+async function testMissingParallelResultIsReemitted(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing missing parallel result recovery...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunFrames([
+    frameMcpExec("call-first", "read", 1),
+    frameMcpExec("call-late", "skill", 2),
+  ]);
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "parallel-result-recovery" }],
+    });
+    await collectSseEvents(first);
+
+    const second = await postChat(port, {
+      model: "composer-2",
+      stream: true,
+      messages: [
+        { role: "user", content: "parallel-result-recovery" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call-first", type: "function", function: { name: "read", arguments: "{}" } },
+            { id: "call-late", type: "function", function: { name: "skill", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call-first", content: "ok" },
+      ],
+    });
+    const events = await collectSseEvents(second);
+    const toolCallIds = events.flatMap((event) =>
+      event.choices?.flatMap((choice: any) =>
+        choice.delta?.tool_calls?.map((call: any) => call.id) ?? []
+      ) ?? []
+    );
+    assertArrayEqual(toolCallIds, ["call-late"], "Expected missing parallel call to be re-emitted");
+    assert(
+      !JSON.stringify(events).includes("Tool result not provided"),
+      "Expected no fabricated tool failure",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+    backend.resetObservations();
+  }
+  console.log("[test] Missing parallel result recovery OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1297,6 +1352,7 @@ async function main() {
     await testModelLimitCache(modules, backend);
     await testUsageFromCheckpointAndTokenDelta(modules, backend);
     await testUsageOnToolCallsAndResume(modules, backend);
+    await testMissingParallelResultIsReemitted(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
