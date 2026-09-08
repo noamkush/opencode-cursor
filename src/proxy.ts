@@ -138,6 +138,9 @@ interface OpenAIMessage {
   content: string | null | ContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
+  /** Non-standard error markers accepted from OpenAI-compatible clients. */
+  is_error?: boolean;
+  isError?: boolean;
 }
 
 interface OpenAIToolDef {
@@ -683,6 +686,7 @@ async function handleChatCompletion(
 interface ToolResultInfo {
   toolCallId: string;
   content: string;
+  isError: boolean;
 }
 
 /** One prior conversation event, in message order. */
@@ -731,6 +735,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
         content,
+        isError: msg.is_error === true || msg.isError === true,
       });
       if (content) history.push({ kind: "tool", text: content });
     } else if (msg.role === "user") {
@@ -1961,7 +1966,7 @@ function handleToolResultResume(
     }
 
     if (exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) => {
+      const sent = sendNativeExecResult(exec, exec.native, text, result.isError, (bytes) => {
         const frame = frameConnectMessage(bytes);
         if (DEBUG) {
           debugLog("exec.result_frame", {
@@ -1997,7 +2002,7 @@ function handleToolResultResume(
               },
             }),
           ],
-          isError: false,
+          isError: result.isError,
         }),
       },
     });

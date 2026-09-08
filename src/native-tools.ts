@@ -12,6 +12,7 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   ExecClientMessageSchema,
+  FetchErrorSchema,
   FetchResultSchema,
   FetchSuccessSchema,
   GrepContentMatchSchema,
@@ -26,17 +27,22 @@ import {
   GrepUnionResultSchema,
   LsDirectoryTreeNodeSchema,
   LsDirectoryTreeNode_FileSchema,
+  LsErrorSchema,
   LsResultSchema,
   LsSuccessSchema,
   ReadResultSchema,
+  ReadErrorSchema,
   ReadSuccessSchema,
+  ShellFailureSchema,
   ShellResultSchema,
   ShellStreamExitSchema,
   ShellStreamSchema,
   ShellStreamStartSchema,
+  ShellStreamStderrSchema,
   ShellStreamStdoutSchema,
   ShellSuccessSchema,
   WriteResultSchema,
+  WriteErrorSchema,
   WriteSuccessSchema,
   type ExecServerMessage,
   type LsDirectoryTreeNode,
@@ -334,6 +340,7 @@ export function sendNativeExecResult(
   exec: PendingNativeExec,
   binding: NativeExecBinding,
   text: string,
+  isError: boolean,
   sendMessage: (bytes: Uint8Array) => void,
 ): boolean {
   const args = binding.args;
@@ -355,6 +362,15 @@ export function sendNativeExecResult(
 
   switch (binding.resultType) {
     case "readResult": {
+      if (isError) {
+        sendExec("readResult", create(ReadResultSchema, {
+          result: {
+            case: "error",
+            value: create(ReadErrorSchema, { path: args.path ?? "", error: text || "Read failed" }),
+          },
+        }));
+        return true;
+      }
       sendExec(
         "readResult",
         create(ReadResultSchema, {
@@ -374,6 +390,15 @@ export function sendNativeExecResult(
     }
 
     case "writeResult": {
+      if (isError) {
+        sendExec("writeResult", create(WriteResultSchema, {
+          result: {
+            case: "error",
+            value: create(WriteErrorSchema, { path: args.path ?? "", error: text || "Write failed" }),
+          },
+        }));
+        return true;
+      }
       sendExec(
         "writeResult",
         create(WriteResultSchema, {
@@ -391,6 +416,15 @@ export function sendNativeExecResult(
     }
 
     case "fetchResult": {
+      if (isError) {
+        sendExec("fetchResult", create(FetchResultSchema, {
+          result: {
+            case: "error",
+            value: create(FetchErrorSchema, { url: args.url ?? "", error: text || "Fetch failed" }),
+          },
+        }));
+        return true;
+      }
       sendExec(
         "fetchResult",
         create(FetchResultSchema, {
@@ -408,20 +442,20 @@ export function sendNativeExecResult(
     }
 
     case "shellResult": {
+      const common = {
+        command: args.command ?? "",
+        workingDirectory: args.workingDirectory ?? "",
+        exitCode: isError ? 1 : 0,
+        signal: "",
+        stdout: isError ? "" : text,
+        stderr: isError ? text || "Command failed" : "",
+      };
       sendExec(
         "shellResult",
         create(ShellResultSchema, {
-          result: {
-            case: "success",
-            value: create(ShellSuccessSchema, {
-              command: args.command ?? "",
-              workingDirectory: args.workingDirectory ?? "",
-              exitCode: 0,
-              signal: "",
-              stdout: text,
-              stderr: "",
-            }),
-          },
+          result: isError
+            ? { case: "failure", value: create(ShellFailureSchema, common) }
+            : { case: "success", value: create(ShellSuccessSchema, common) },
         }),
       );
       return true;
@@ -435,26 +469,33 @@ export function sendNativeExecResult(
         }),
       );
       if (text) {
+        const event = isError
+          ? { case: "stderr" as const, value: create(ShellStreamStderrSchema, { data: text }) }
+          : { case: "stdout" as const, value: create(ShellStreamStdoutSchema, { data: text }) };
         sendExec(
           "shellStream",
-          create(ShellStreamSchema, {
-            event: {
-              case: "stdout",
-              value: create(ShellStreamStdoutSchema, { data: text }),
-            },
-          }),
+          create(ShellStreamSchema, { event }),
         );
       }
       sendExec(
         "shellStream",
         create(ShellStreamSchema, {
-          event: { case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) },
+          event: { case: "exit", value: create(ShellStreamExitSchema, { code: isError ? 1 : 0 }) },
         }),
       );
       return true;
     }
 
     case "lsResult": {
+      if (isError) {
+        sendExec("lsResult", create(LsResultSchema, {
+          result: {
+            case: "error",
+            value: create(LsErrorSchema, { path: args.path ?? "", error: text || "List failed" }),
+          },
+        }));
+        return true;
+      }
       const built = buildLsResult(text, args.path ?? "");
       if (!built) return false;
       sendExec("lsResult", built);
@@ -462,6 +503,12 @@ export function sendNativeExecResult(
     }
 
     case "grepResult": {
+      if (isError) {
+        sendExec("grepResult", create(GrepResultSchema, {
+          result: { case: "error", value: create(GrepErrorSchema, { error: text || "Grep failed" }) },
+        }));
+        return true;
+      }
       const built = buildGrepResult(text, args);
       if (!built) return false;
       sendExec("grepResult", built);
