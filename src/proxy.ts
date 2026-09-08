@@ -173,7 +173,7 @@ interface CursorRequestPayload {
 }
 
 /** A pending tool execution waiting for results from the caller. */
-interface PendingExec {
+export interface PendingExec {
   execId: string;
   execMsgId: number;
   toolCallId: string;
@@ -1169,6 +1169,7 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   onUnhandledExec?: (execCase: string) => void,
+  onExecAbort?: (execMsgId: number) => void,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1193,6 +1194,10 @@ function processServerMessage(
       return;
     }
     sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, response)));
+  } else if (msgCase === "execServerControlMessage") {
+    if (msg.message.value.message.case === "abort") {
+      onExecAbort?.(msg.message.value.message.value.id);
+    }
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -1517,6 +1522,46 @@ function sendExecStreamClose(execMsgId: number, sendFrame: (data: Uint8Array) =>
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
+/** Remove and fail a deferred exec targeted by Cursor's server-side abort. */
+export function abortPendingExec(
+  execs: PendingExec[],
+  execMsgId: number,
+  sendFrame: (data: Uint8Array) => void,
+): boolean {
+  const index = execs.findIndex((exec) => exec.execMsgId === execMsgId);
+  if (index === -1) return false;
+  const [exec] = execs.splice(index, 1);
+  if (!exec) return false;
+
+  if (exec.native) {
+    sendNativeExecResult(
+      exec,
+      exec.native,
+      "Tool execution aborted by Cursor",
+      true,
+      (bytes) => sendFrame(frameConnectMessage(bytes)),
+    );
+  } else {
+    const result = create(McpResultSchema, {
+      result: {
+        case: "error",
+        value: create(McpErrorSchema, { error: "Tool execution aborted by Cursor" }),
+      },
+    });
+    const execClientMessage = create(ExecClientMessageSchema, {
+      id: exec.execMsgId,
+      execId: exec.execId,
+      message: { case: "mcpResult", value: result },
+    });
+    const clientMessage = create(AgentClientMessageSchema, {
+      message: { case: "execClientMessage", value: execClientMessage },
+    });
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  }
+  sendExecStreamClose(exec.execMsgId, sendFrame);
+  return true;
+}
+
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
@@ -1812,6 +1857,11 @@ function createBridgeStreamResponse(
                 if (active) active.totalTokens = state.totalTokens;
               },
               (execCase) => failStream(`Unsupported Cursor exec request: ${execCase}`),
+              (execMsgId) => {
+                const active = activeBridges.get(bridgeKey);
+                if (abortPendingExec(state.pendingExecs, execMsgId, (data) => bridge.write(data))) return;
+                if (active) abortPendingExec(active.queuedExecs, execMsgId, (data) => bridge.write(data));
+              },
             );
           } catch (error) {
             failStream(`Failed to process Cursor server message: ${error instanceof Error ? error.message : String(error)}`);
@@ -2147,6 +2197,7 @@ async function collectFullResponse(
             debugLog("server.unsupported_request", { requestCase });
             bridge.kill();
           },
+          () => {},
         );
       } catch (error) {
         debugLog("server.message_process_failed", {
