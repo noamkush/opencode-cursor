@@ -69,6 +69,7 @@ import {
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
+import { buildInteractionResponse } from "./interaction-query";
 import {
   normalizeEditArgs,
   normalizeFilePathArgs,
@@ -1184,6 +1185,14 @@ function processServerMessage(
       onMcpExec,
       onUnhandledExec,
     );
+  } else if (msgCase === "interactionQuery") {
+    const response = buildInteractionResponse(msg.message.value);
+    if (!response) {
+      const queryCase = msg.message.value.query.case ?? "unknown";
+      onUnhandledExec?.(`interactionQuery.${queryCase}`);
+      return;
+    }
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, response)));
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -2133,6 +2142,10 @@ async function collectFullResponse(
               stored.lastAccessMs = Date.now();
               persistConversation(convKey, stored);
             }
+          },
+          (requestCase) => {
+            debugLog("server.unsupported_request", { requestCase });
+            bridge.kill();
           },
         );
       } catch (error) {
