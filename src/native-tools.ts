@@ -333,7 +333,6 @@ export function redirectNativeExec(
           path: args.path ?? "",
           outputMode: args.outputMode || "content",
           ...(args.multiline ? { multiline: "true" } : undefined),
-          ...(args.headLimit != null ? { headLimit: String(args.headLimit) } : undefined),
         },
       },
     };
@@ -660,8 +659,23 @@ function computeLsStats(node: LsDirectoryTreeNode): void {
   node.fullSubtreeExtensionCounts = extensionCounts;
 }
 
-/** Parse the client grep tool's text output back into Cursor's structured result. */
-function buildGrepResult(content: string, args: Record<string, string>) {
+/**
+ * Parse grep/glob tool text into Cursor's structured result.
+ * OpenCode grep is `path:` headers and `  Line N:` records. A pattern-less
+ * grep is served by glob, which lists one path per line.
+ */
+export function buildGrepResult(content: string, args: Record<string, string>) {
+  if (content.includes("Ripgrep JSON record exceeded")) {
+    return create(GrepResultSchema, {
+      result: {
+        case: "error",
+        value: create(GrepErrorSchema, {
+          error: `${content.trim()} Retry with a more specific path or include glob.`,
+        }),
+      },
+    });
+  }
+
   const pattern = args.pattern ?? "";
   const path = args.path ?? "";
   const outputMode = args.outputMode || "content";
@@ -671,16 +685,21 @@ function buildGrepResult(content: string, args: Record<string, string>) {
     return null;
   }
 
-  const unionResult =
-    outputMode === "count"
-      ? buildGrepCountResult(content, Boolean(args.headLimit))
-      : outputMode === "files_with_matches"
-        ? buildGrepFilesResult(content, Boolean(args.headLimit))
-        : buildGrepContentResult(content, Boolean(args.headLimit));
+  const lines = grepLines(content);
+  const truncated = isGrepTruncated(lines);
+  const matches = parseOpenCodeGrep(lines);
+  // Line records that never name a file are not an empty search.
+  if (matches && matches.length === 0) return null;
 
-  // Non-empty tool output that we failed to parse: better to hand the raw
-  // text back as an mcpResult than to claim "no matches".
-  if (content.trim() && isEmptyGrepUnion(unionResult)) return null;
+  const unionResult = matches
+    ? projectGrepMatches(matches, outputMode, truncated)
+    : outputMode === "files_with_matches"
+      ? buildGrepFilesResult(grepPaths(lines), truncated)
+      : lines.every((line) => isGrepNoise(line))
+        ? projectGrepMatches([], outputMode, truncated)
+        : null;
+  // Unrecognized text goes back as an mcpResult rather than "no matches".
+  if (!unionResult) return null;
 
   return create(GrepResultSchema, {
     result: {
@@ -697,20 +716,94 @@ function buildGrepResult(content: string, args: Record<string, string>) {
   });
 }
 
-function buildGrepCountResult(content: string, clientTruncated: boolean) {
+interface OpenCodeGrepMatch {
+  file: string;
+  lineNumber: number;
+  content: string;
+}
+
+const GREP_NO_MATCHES = /^(?:No files found|No matches found)$/;
+const GREP_SUMMARY = /^Found \d+ matches(?: \(more matches available\))?$/;
+const GREP_TRUNCATED = /^\(Results(?: are)? truncated\b/;
+const OPENCODE_LINE = /^ {2}Line (\d+): (.*)$/;
+
+function grepLines(content: string): string[] {
+  return content.split("\n").map((line) => line.replace(/\r$/, ""));
+}
+
+function isGrepNoise(line: string): boolean {
+  const trimmed = line.trim();
+  return !trimmed || GREP_NO_MATCHES.test(trimmed) || GREP_SUMMARY.test(trimmed) || GREP_TRUNCATED.test(trimmed);
+}
+
+function isGrepTruncated(lines: readonly string[]): boolean {
+  return lines.some(
+    (line) => GREP_TRUNCATED.test(line.trim()) || line.includes("more matches available"),
+  );
+}
+
+/**
+ * OpenCode grep records. `null` when the text has no `  Line N:` records;
+ * an empty list when those records never follow a `path:` header.
+ */
+function parseOpenCodeGrep(lines: readonly string[]): OpenCodeGrepMatch[] | null {
+  if (!lines.some((line) => OPENCODE_LINE.test(line))) return null;
+
+  const matches: OpenCodeGrepMatch[] = [];
+  let currentFile = "";
+  for (const line of lines) {
+    if (isGrepNoise(line)) continue;
+    const match = line.match(OPENCODE_LINE);
+    if (match) {
+      if (!currentFile) continue;
+      matches.push({
+        file: currentFile,
+        lineNumber: Number.parseInt(match[1]!, 10),
+        content: match[2]!,
+      });
+      continue;
+    }
+    if (line.endsWith(":") && !line.startsWith(" ")) currentFile = line.slice(0, -1);
+  }
+  return matches;
+}
+
+/** Non-noise lines of a glob listing, in order. */
+function grepPaths(lines: readonly string[]): string[] {
+  return lines.flatMap((line) => {
+    if (isGrepNoise(line)) return [];
+    const path = line.trim();
+    return path ? [path] : [];
+  });
+}
+
+function projectGrepMatches(
+  matches: readonly OpenCodeGrepMatch[],
+  outputMode: string,
+  ripgrepTruncated: boolean,
+) {
+  if (outputMode === "count") return buildGrepCountResult(matches, ripgrepTruncated);
+  if (outputMode === "files_with_matches") return buildGrepFilesResult(uniqueGrepFiles(matches), ripgrepTruncated);
+  return buildGrepContentResult(matches, ripgrepTruncated);
+}
+
+function uniqueGrepFiles(matches: readonly OpenCodeGrepMatch[]): string[] {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  for (const match of matches) {
+    if (seen.has(match.file)) continue;
+    seen.add(match.file);
+    files.push(match.file);
+  }
+  return files;
+}
+
+function buildGrepCountResult(matches: readonly OpenCodeGrepMatch[], ripgrepTruncated: boolean) {
   const counts: ReturnType<typeof create<typeof GrepFileCountSchema>>[] = [];
-  let totalMatches = 0;
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.replace(/\r$/, "");
-    if (!line) continue;
-    const separator = line.lastIndexOf(":");
-    if (separator === -1) continue;
-    const tail = line.slice(separator + 1);
-    if (!/^\d+$/.test(tail)) continue;
-    const file = line.slice(0, separator);
-    const count = Number.parseInt(tail, 10);
-    counts.push(create(GrepFileCountSchema, { file, count }));
-    totalMatches += count;
+  for (const match of matches) {
+    const current = counts.find((entry) => entry.file === match.file);
+    if (current) current.count += 1;
+    else counts.push(create(GrepFileCountSchema, { file: match.file, count: 1 }));
   }
 
   return {
@@ -718,132 +811,58 @@ function buildGrepCountResult(content: string, clientTruncated: boolean) {
     value: create(GrepCountResultSchema, {
       counts,
       totalFiles: counts.length,
-      totalMatches,
-      clientTruncated,
-      ripgrepTruncated: false,
+      totalMatches: matches.length,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
 }
 
-function buildGrepFilesResult(content: string, clientTruncated: boolean) {
-  const files = content
-    .split("\n")
-    .map((line) => line.replace(/\r$/, "").trim())
-    .filter(Boolean);
-
+function buildGrepFilesResult(files: readonly string[], ripgrepTruncated: boolean) {
   return {
     case: "files" as const,
     value: create(GrepFilesResultSchema, {
-      files,
+      files: [...files],
       totalFiles: files.length,
-      clientTruncated,
-      ripgrepTruncated: false,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
 }
 
-function buildGrepContentResult(content: string, clientTruncated: boolean) {
+function buildGrepContentResult(matches: readonly OpenCodeGrepMatch[], ripgrepTruncated: boolean) {
   const fileMatches: ReturnType<typeof create<typeof GrepFileMatchSchema>>[] = [];
   let currentFile = "";
   let currentMatches: ReturnType<typeof create<typeof GrepContentMatchSchema>>[] = [];
-  let totalLines = 0;
-  let totalMatchedLines = 0;
 
   const flushFile = () => {
-    if (currentFile && currentMatches.length > 0) {
-      fileMatches.push(
-        create(GrepFileMatchSchema, { file: currentFile, matches: currentMatches }),
-      );
-    }
+    if (!currentFile || currentMatches.length === 0) return;
+    fileMatches.push(create(GrepFileMatchSchema, { file: currentFile, matches: currentMatches }));
     currentMatches = [];
   };
 
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.replace(/\r$/, "");
-    if (line === "--" || line === "") continue;
-
-    const matchLine = line.match(/^(.+?):(\d+):(.*)/);
-    if (matchLine) {
-      const file = matchLine[1]!;
-      if (file !== currentFile) {
-        flushFile();
-        currentFile = file;
-      }
-      totalLines += 1;
-      totalMatchedLines += 1;
-      currentMatches.push(
-        create(GrepContentMatchSchema, {
-          lineNumber: Number.parseInt(matchLine[2]!, 10),
-          content: matchLine[3]!,
-          contentTruncated: false,
-          isContextLine: false,
-        }),
-      );
-      continue;
-    }
-
-    const contextLine = parseGrepContextLine(line, currentFile);
-    if (!contextLine) continue;
-    if (contextLine.file !== currentFile) {
+  for (const match of matches) {
+    if (match.file !== currentFile) {
       flushFile();
-      currentFile = contextLine.file;
+      currentFile = match.file;
     }
-    totalLines += 1;
-    currentMatches.push(
-      create(GrepContentMatchSchema, {
-        lineNumber: contextLine.lineNumber,
-        content: contextLine.content,
-        contentTruncated: false,
-        isContextLine: true,
-      }),
-    );
+    currentMatches.push(create(GrepContentMatchSchema, {
+      lineNumber: match.lineNumber,
+      content: match.content,
+      contentTruncated: false,
+      isContextLine: false,
+    }));
   }
-
   flushFile();
 
   return {
     case: "content" as const,
     value: create(GrepContentResultSchema, {
       matches: fileMatches,
-      totalLines,
-      totalMatchedLines,
-      clientTruncated,
-      ripgrepTruncated: false,
+      totalLines: matches.length,
+      totalMatchedLines: matches.length,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
-}
-
-function parseGrepContextLine(line: string, currentFile: string) {
-  if (currentFile) {
-    const prefix = `${currentFile}-`;
-    if (line.startsWith(prefix)) {
-      const match = line.slice(prefix.length).match(/^(\d+)-(.*)$/s);
-      if (match) {
-        return {
-          file: currentFile,
-          lineNumber: Number.parseInt(match[1]!, 10),
-          content: match[2]!,
-        };
-      }
-    }
-  }
-
-  const fallback = line.match(/^(.+?)-(\d+)-(.*)$/);
-  if (!fallback) return null;
-  return {
-    file: fallback[1]!,
-    lineNumber: Number.parseInt(fallback[2]!, 10),
-    content: fallback[3]!,
-  };
-}
-
-function isEmptyGrepUnion(
-  result:
-    | ReturnType<typeof buildGrepCountResult>
-    | ReturnType<typeof buildGrepFilesResult>
-    | ReturnType<typeof buildGrepContentResult>,
-): boolean {
-  if (result.case === "count") return result.value.counts.length === 0;
-  if (result.case === "files") return result.value.files.length === 0;
-  return result.value.matches.length === 0;
 }
