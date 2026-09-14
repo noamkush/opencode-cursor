@@ -622,7 +622,11 @@ function computeLsStats(node: LsDirectoryTreeNode): void {
   node.fullSubtreeExtensionCounts = extensionCounts;
 }
 
-/** Parse the client grep tool's text output back into Cursor's structured result. */
+/**
+ * Parse grep/glob tool text into Cursor's structured result.
+ * OpenCode grep is rewritten into ripgrep `file:line:content` (or files/count)
+ * so the original parsers can run unchanged.
+ */
 export function buildGrepResult(content: string, args: Record<string, string>) {
   if (content.includes("Ripgrep JSON record exceeded")) {
     return create(GrepResultSchema, {
@@ -644,16 +648,21 @@ export function buildGrepResult(content: string, args: Record<string, string>) {
     return null;
   }
 
+  const truncated = isGrepTruncated(content);
+  const rewritten = rewriteOpenCodeGrep(content, outputMode);
+  const text = rewritten ?? stripGrepNoise(content);
+  const noMatches = rewritten === null && !text.trim();
+
   const unionResult =
     outputMode === "count"
-      ? buildGrepCountResult(content, Boolean(args.headLimit))
+      ? buildGrepCountResult(text, truncated)
       : outputMode === "files_with_matches"
-        ? buildGrepFilesResult(content, Boolean(args.headLimit))
-        : buildGrepContentResult(content, Boolean(args.headLimit));
+        ? buildGrepFilesResult(text, truncated)
+        : buildGrepContentResult(text, truncated);
 
   // Non-empty tool output that we failed to parse: better to hand the raw
   // text back as an mcpResult than to claim "no matches".
-  if (content.trim() && isEmptyGrepUnion(unionResult)) return null;
+  if (!noMatches && isEmptyGrepUnion(unionResult)) return null;
 
   return create(GrepResultSchema, {
     result: {
@@ -670,7 +679,82 @@ export function buildGrepResult(content: string, args: Record<string, string>) {
   });
 }
 
-function buildGrepCountResult(content: string, clientTruncated: boolean) {
+const GREP_NO_MATCHES = /^No files found$/;
+const GREP_SUMMARY = /^Found \d+ matches(?: \(more matches available\))?$/;
+const GREP_TRUNCATED = /^\(Results(?: are)? truncated\b/;
+const OPENCODE_LINE = /^ {2}Line (\d+): (.*)$/;
+
+function grepLines(content: string): string[] {
+  return content.split("\n").map((line) => line.replace(/\r$/, ""));
+}
+
+function isGrepNoise(line: string): boolean {
+  const trimmed = line.trim();
+  return !trimmed || GREP_NO_MATCHES.test(trimmed) || GREP_SUMMARY.test(trimmed) || GREP_TRUNCATED.test(trimmed);
+}
+
+function isGrepTruncated(content: string): boolean {
+  return grepLines(content).some(
+    (line) => GREP_TRUNCATED.test(line.trim()) || line.includes("more matches available"),
+  );
+}
+
+function stripGrepNoise(content: string): string {
+  return grepLines(content).filter((line) => !isGrepNoise(line)).join("\n");
+}
+
+/** Convert OpenCode's `path:` / `  Line N:` output into ripgrep-shaped text. */
+function rewriteOpenCodeGrep(content: string, outputMode: string): string | null {
+  const lines = grepLines(content);
+  if (!lines.some((line) => OPENCODE_LINE.test(line))) return null;
+
+  const matches: { file: string; lineNumber: number; content: string }[] = [];
+  let currentFile = "";
+  for (const line of lines) {
+    if (!line || isGrepNoise(line)) continue;
+    const match = line.match(OPENCODE_LINE);
+    if (match) {
+      if (!currentFile) continue;
+      matches.push({
+        file: currentFile,
+        lineNumber: Number.parseInt(match[1]!, 10),
+        content: match[2]!,
+      });
+      continue;
+    }
+    if (line.endsWith(":") && !line.startsWith(" ")) {
+      currentFile = line.slice(0, -1);
+    }
+  }
+  if (matches.length === 0) return null;
+
+  if (outputMode === "files_with_matches") {
+    const files: string[] = [];
+    const seen = new Set<string>();
+    for (const match of matches) {
+      if (seen.has(match.file)) continue;
+      seen.add(match.file);
+      files.push(match.file);
+    }
+    return files.join("\n");
+  }
+
+  if (outputMode === "count") {
+    const counts = new Map<string, number>();
+    const order: string[] = [];
+    for (const match of matches) {
+      if (!counts.has(match.file)) order.push(match.file);
+      counts.set(match.file, (counts.get(match.file) ?? 0) + 1);
+    }
+    return order.map((file) => `${file}:${counts.get(file)}`).join("\n");
+  }
+
+  return matches
+    .map((match) => `${match.file}:${match.lineNumber}:${match.content}`)
+    .join("\n");
+}
+
+function buildGrepCountResult(content: string, ripgrepTruncated: boolean) {
   const counts: ReturnType<typeof create<typeof GrepFileCountSchema>>[] = [];
   let totalMatches = 0;
   for (const rawLine of content.split("\n")) {
@@ -692,13 +776,13 @@ function buildGrepCountResult(content: string, clientTruncated: boolean) {
       counts,
       totalFiles: counts.length,
       totalMatches,
-      clientTruncated,
-      ripgrepTruncated: false,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
 }
 
-function buildGrepFilesResult(content: string, clientTruncated: boolean) {
+function buildGrepFilesResult(content: string, ripgrepTruncated: boolean) {
   const files = content
     .split("\n")
     .map((line) => line.replace(/\r$/, "").trim())
@@ -709,13 +793,13 @@ function buildGrepFilesResult(content: string, clientTruncated: boolean) {
     value: create(GrepFilesResultSchema, {
       files,
       totalFiles: files.length,
-      clientTruncated,
-      ripgrepTruncated: false,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
 }
 
-function buildGrepContentResult(content: string, clientTruncated: boolean) {
+function buildGrepContentResult(content: string, ripgrepTruncated: boolean) {
   const fileMatches: ReturnType<typeof create<typeof GrepFileMatchSchema>>[] = [];
   let currentFile = "";
   let currentMatches: ReturnType<typeof create<typeof GrepContentMatchSchema>>[] = [];
@@ -780,8 +864,8 @@ function buildGrepContentResult(content: string, clientTruncated: boolean) {
       matches: fileMatches,
       totalLines,
       totalMatchedLines,
-      clientTruncated,
-      ripgrepTruncated: false,
+      clientTruncated: false,
+      ripgrepTruncated,
     }),
   };
 }
