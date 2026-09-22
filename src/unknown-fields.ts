@@ -22,6 +22,32 @@ import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 export const INTERACTION_WEB_FETCH_FIELD = 9;
 
 /**
+ * `ExecServerMessage.mcp_state_exec_args` (request) and
+ * `ExecClientMessage.mcp_state_exec_result` (response), both
+ * length-delimited messages. Added in Cursor 2026.09.18.
+ */
+export const EXEC_MCP_STATE_FIELD = 36;
+
+/**
+ * `ExecServerMessage.accept_hook_additional_contexts`, a varint bool. Only
+ * named in diagnostics; the proxy does not act on it.
+ */
+export const EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD = 55;
+
+/**
+ * `RequestContext.mcp_meta_tool_options`, a length-delimited
+ * `McpMetaToolOptions`. Current Cursor clients always send it; the agent
+ * lists MCP servers from its descriptors.
+ */
+export const REQUEST_CONTEXT_MCP_META_TOOL_OPTIONS_FIELD = 34;
+
+/** `RequestContext.mcp_info_complete`, a varint bool. */
+export const REQUEST_CONTEXT_MCP_INFO_COMPLETE_FIELD = 36;
+
+/** `McpArgs.server_identifier`, a string naming the tool's MCP server. */
+export const MCP_ARGS_SERVER_IDENTIFIER_FIELD = 9;
+
+/**
  * `ReadArgs.offset`, an optional varint int32. 1-based start line; a
  * negative value counts back from the end of the file.
  */
@@ -80,6 +106,20 @@ function readLastVarint(
 /** Encode a varint bool unknown field. */
 export function unknownBoolField(no: number, value: boolean): UnknownField {
   return { no, wireType: WireType.Varint, data: new BinaryWriter().bool(value).finish() };
+}
+
+/**
+ * The serialized message inside a length-delimited unknown field, or
+ * `undefined` when the length prefix is malformed.
+ */
+export function unknownMessageBytes(field: UnknownField): Uint8Array | undefined {
+  try {
+    const reader = new BinaryReader(field.data);
+    const bytes = reader.bytes();
+    return reader.pos === reader.len ? bytes : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Encode `message` (already serialized) as a length-delimited unknown field. */

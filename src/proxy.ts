@@ -15,6 +15,7 @@
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson, type UnknownField } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
+import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -78,10 +79,23 @@ import {
   type ConversationStateStructure,
   type ExecServerMessage,
   type KvServerMessage,
+  type McpArgs,
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { buildInteractionResponse } from "./interaction-query";
+import { decodeMcpServerNames, MCP_SERVERS_HEADER } from "./mcp-servers";
 import { decodeToolErrorIds, markToolErrors, TOOL_ERRORS_HEADER, toolErrorText } from "./tool-errors";
+import {
+  EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD,
+  EXEC_MCP_STATE_FIELD,
+  findUnknownField,
+  MCP_ARGS_SERVER_IDENTIFIER_FIELD,
+  REQUEST_CONTEXT_MCP_INFO_COMPLETE_FIELD,
+  REQUEST_CONTEXT_MCP_META_TOOL_OPTIONS_FIELD,
+  unknownBoolField,
+  unknownMessageBytes,
+  unknownMessageField,
+} from "./unknown-fields";
 import {
   bindReadOutput,
   normalizeToolArgs,
@@ -109,6 +123,8 @@ const DEBUG = Boolean(process.env.CURSOR_PROXY_DEBUG);
 const STREAM_STALL_TIMEOUT_MS = 90_000;
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
 const TOOL_BATCH_QUIET_MS = 500;
+/** Provider identifier for OpenCode's built-in (non-MCP) tools. */
+const OPENCODE_PROVIDER = "opencode";
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -580,7 +596,8 @@ export async function startProxy(
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
+          const mcpServers = decodeMcpServerNames(req.headers.get(MCP_SERVERS_HEADER));
+          return handleChatCompletion(body, accessToken, mcpServers);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
@@ -621,6 +638,7 @@ export function stopProxy(): void {
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  mcpServers: readonly string[],
 ): Promise<Response> {
   const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
@@ -682,7 +700,7 @@ async function handleChatCompletion(
 
   // Build the request. When the bridge died mid tool-call, history already
   // contains the tool results and the request goes out as a resumeAction.
-  const mcpTools = buildMcpToolDefinitions(tools);
+  const mcpTools = buildMcpToolDefinitions(tools, mcpServers);
   const payload = buildCursorRequest(
     modelId, systemPrompts, userText, history,
     stored.conversationId, stored.checkpoint, stored.blobStore,
@@ -773,8 +791,18 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return { systemPrompts, userText, history, toolResults };
 }
 
-/** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
-function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
+/**
+ * Convert OpenAI tool definitions to Cursor's MCP tool protobuf format.
+ * Tools of a connected MCP server keep their OpenCode name in `name` and are
+ * attributed to that server; every other tool belongs to the built-in
+ * "opencode" provider.
+ */
+export function buildMcpToolDefinitions(
+  tools: OpenAIToolDef[],
+  mcpServers: readonly string[] = [],
+): McpToolDefinition[] {
+  // Longest prefix first, so server "a_b" claims "a_b_x" before server "a".
+  const servers = [...mcpServers].sort((a, b) => b.length - a.length);
   return tools.map((t) => {
     const fn = t.function;
     const jsonSchema: JsonValue =
@@ -782,11 +810,12 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
         ? (fn.parameters as JsonValue)
         : { type: "object", properties: {}, required: [] };
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
+    const server = servers.find((name) => fn.name.length > name.length + 1 && fn.name.startsWith(`${name}_`));
     return create(McpToolDefinitionSchema, {
       name: fn.name,
       description: fn.description || "",
-      providerIdentifier: "opencode",
-      toolName: fn.name,
+      providerIdentifier: server ?? OPENCODE_PROVIDER,
+      toolName: server ? fn.name.slice(server.length + 1) : fn.name,
       inputSchema,
     });
   });
@@ -1321,6 +1350,7 @@ export function handleExecMessage(
       fileContents: {},
       customSubagents: [],
     });
+    requestContext.$unknown = buildMcpRequestContextFields(mcpTools);
     const result = create(RequestContextResultSchema, {
       result: {
         case: "success",
@@ -1333,7 +1363,7 @@ export function handleExecMessage(
 
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
-    const toolName = mcpArgs.toolName || mcpArgs.name;
+    const toolName = resolveMcpToolName(mcpArgs, mcpTools);
     const decoded = normalizeToolArgs(toolName, decodeMcpArgsMap(mcpArgs.args ?? {}), mcpTools);
     onMcpExec({
       execId: execMsg.execId,
@@ -1342,6 +1372,14 @@ export function handleExecMessage(
       toolName,
       decodedArgs: JSON.stringify(decoded),
     });
+    return;
+  }
+
+  // mcp_state_exec_args arrives in $unknown; see src/unknown-fields.ts.
+  if (isMcpStateExecRequest(execMsg.$unknown)) {
+    const response = buildMcpStateExecClientMessage(execMsg, mcpTools);
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, response)));
+    sendExecStreamClose(execMsg.id, sendFrame);
     return;
   }
 
@@ -1483,12 +1521,160 @@ export function handleExecMessage(
  */
 export function describeUnknownExecFields(
   unknownFields: readonly UnknownField[] | undefined,
-): Array<{ fieldNumber: number; wireType: number; encodedBytes: number }> {
+): Array<{ fieldNumber: number; fieldName?: string; wireType: number; encodedBytes: number }> {
   return (unknownFields ?? []).map((field) => ({
     fieldNumber: field.no,
+    fieldName: cursorExecFieldName(field.no),
     wireType: field.wireType,
     encodedBytes: field.data.length,
   }));
+}
+
+function cursorExecFieldName(fieldNumber: number): string | undefined {
+  switch (fieldNumber) {
+    case EXEC_MCP_STATE_FIELD:
+      return "mcpStateExecArgs";
+    case EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD:
+      return "acceptHookAdditionalContexts";
+    default:
+      return undefined;
+  }
+}
+
+/** Whether a newer Cursor sent its mcp_state_exec_args oneof field. */
+export function isMcpStateExecRequest(
+  unknownFields: readonly UnknownField[] | undefined,
+): boolean {
+  return findUnknownField(unknownFields, EXEC_MCP_STATE_FIELD, WireType.LengthDelimited) !== undefined;
+}
+
+/**
+ * Build a field-36 mcp_state_exec_result without fabricating a generated
+ * schema. The server and tool definitions are already represented locally;
+ * only the newer outer result oneof is encoded here.
+ */
+export function buildMcpStateExecClientMessage(
+  execMsg: ExecServerMessage,
+  mcpTools: readonly McpToolDefinition[],
+) {
+  const requestedServers = mcpStateServerIdentifiers(execMsg.$unknown);
+
+  // McpStateExecResult { success: { servers: [{ name, identifier, tools, status }] } }
+  const result = new BinaryWriter().tag(1, WireType.LengthDelimited).fork();
+  const servers = requestedServers === null ? [] : [...groupMcpTools(mcpTools)].filter(([server]) =>
+    requestedServers.length === 0 || requestedServers.includes(server));
+  for (const [server, tools] of servers) {
+    result.tag(1, WireType.LengthDelimited).fork()
+      .tag(1, WireType.LengthDelimited).string(server === OPENCODE_PROVIDER ? "OpenCode" : server)
+      .tag(2, WireType.LengthDelimited).string(server);
+    for (const tool of tools) {
+      result.tag(5, WireType.LengthDelimited).bytes(toBinary(McpToolDefinitionSchema, tool));
+    }
+    result.tag(7, WireType.LengthDelimited).string("connected");
+    result.join();
+  }
+  const clientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  clientMessage.$unknown = [unknownMessageField(EXEC_MCP_STATE_FIELD, result.join().finish())];
+  return create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: clientMessage },
+  });
+}
+
+/**
+ * Decode the requested `server_identifiers` from field-36 args. `null` means
+ * malformed data, which fails closed by advertising no server.
+ */
+function mcpStateServerIdentifiers(
+  unknownFields: readonly UnknownField[] | undefined,
+): string[] | null {
+  const stateField = findUnknownField(unknownFields, EXEC_MCP_STATE_FIELD, WireType.LengthDelimited);
+  const payload = stateField && unknownMessageBytes(stateField);
+  if (!payload) return null;
+
+  const identifiers: string[] = [];
+  try {
+    const reader = new BinaryReader(payload);
+    while (reader.pos < reader.len) {
+      const [fieldNo, wireType] = reader.tag();
+      if (fieldNo === 2 && wireType === WireType.Varint) {
+        reader.bool(); // kick_only
+        continue;
+      }
+      if (fieldNo !== 1 || wireType !== WireType.LengthDelimited) return null;
+      identifiers.push(reader.string());
+    }
+  } catch {
+    return null;
+  }
+  return identifiers;
+}
+
+/** Tools by provider, built-in "opencode" first even when it has no tools. */
+function groupMcpTools(mcpTools: readonly McpToolDefinition[]): Map<string, McpToolDefinition[]> {
+  const servers = new Map<string, McpToolDefinition[]>([[OPENCODE_PROVIDER, []]]);
+  for (const tool of mcpTools) {
+    const server = tool.providerIdentifier || OPENCODE_PROVIDER;
+    const group = servers.get(server);
+    if (group) group.push(tool);
+    else servers.set(server, [tool]);
+  }
+  return servers;
+}
+
+/**
+ * RequestContext fields, newer than the checked-in schema, that tell Cursor's
+ * agent which MCP servers exist. Built-in tools stay out of the descriptors:
+ * Cursor exposes RequestContext.tools directly either way.
+ */
+export function buildMcpRequestContextFields(
+  mcpTools: readonly McpToolDefinition[],
+): UnknownField[] {
+  const servers = [...groupMcpTools(mcpTools)].filter(([server]) => server !== OPENCODE_PROVIDER);
+  if (servers.length === 0) return [];
+
+  // McpMetaToolOptions { enabled, mcp_descriptors: [{ server_name, server_identifier, tools }] }
+  const options = new BinaryWriter().tag(1, WireType.Varint).bool(true);
+  for (const [server, tools] of servers) {
+    options.tag(2, WireType.LengthDelimited).fork()
+      .tag(1, WireType.LengthDelimited).string(server)
+      .tag(2, WireType.LengthDelimited).string(server);
+    for (const tool of tools) {
+      // McpToolDescriptor { tool_name, description, input_schema }
+      options.tag(5, WireType.LengthDelimited).fork()
+        .tag(1, WireType.LengthDelimited).string(tool.toolName)
+        .tag(3, WireType.LengthDelimited).string(tool.description)
+        .tag(4, WireType.LengthDelimited).bytes(tool.inputSchema)
+        .join();
+    }
+    options.join();
+  }
+  return [
+    unknownMessageField(REQUEST_CONTEXT_MCP_META_TOOL_OPTIONS_FIELD, options.finish()),
+    unknownBoolField(REQUEST_CONTEXT_MCP_INFO_COMPLETE_FIELD, true),
+  ];
+}
+
+/**
+ * Map a Cursor MCP call back to the OpenCode tool name. Cursor addresses MCP
+ * tools by server and raw tool name; built-in tools use their own name.
+ */
+export function resolveMcpToolName(
+  mcpArgs: McpArgs,
+  mcpTools: readonly McpToolDefinition[],
+): string {
+  const serverField = findUnknownField(mcpArgs.$unknown, MCP_ARGS_SERVER_IDENTIFIER_FIELD, WireType.LengthDelimited);
+  const serverBytes = serverField && unknownMessageBytes(serverField);
+  const server = (serverBytes && new TextDecoder().decode(serverBytes)) || mcpArgs.providerIdentifier;
+  const exact = mcpTools.find((tool) => tool.providerIdentifier === server && tool.toolName === mcpArgs.toolName);
+  if (exact) return exact.name;
+
+  const fallback = mcpArgs.toolName || mcpArgs.name;
+  if (mcpTools.some((tool) => tool.name === fallback)) return fallback;
+  const byToolName = mcpTools.filter((tool) => tool.toolName === mcpArgs.toolName);
+  return byToolName.length === 1 ? byToolName[0]!.name : fallback;
 }
 
 /** Build valid typed failures for known execs this proxy cannot provide. */

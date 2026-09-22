@@ -11,6 +11,7 @@ import {
   type CursorModel,
 } from "./models";
 import { startProxy, stopProxy } from "./proxy";
+import { withMcpServerNames } from "./mcp-servers";
 import { collectToolErrorIds, markToolErrors } from "./tool-errors";
 
 const CURSOR_ID = "cursor";
@@ -47,6 +48,7 @@ const CursorV2Plugin = Plugin.define({
     await ctx.session.hook("http.request", async (event) => {
       const ids = toolErrors.get(`${event.sessionID}:${event.kind}`);
       if (ids) event.request = await markToolErrors(event.request, ids);
+      event.request = withMcpServerNames(event.request, await connectedMcpServers(ctx, event.sessionID));
     }, { providerID: CURSOR_ID });
 
     await ctx.integration.transform((draft) => {
@@ -160,6 +162,17 @@ async function loadInventory(
     return { models, port, connection };
   } catch {
     return undefined;
+  }
+}
+
+/** MCP servers connected in the session's directory; empty when unknown. */
+async function connectedMcpServers(ctx: Plugin.Context, sessionID: string): Promise<string[]> {
+  try {
+    const session = await ctx.session.get({ sessionID });
+    const servers = await ctx.mcp.list({ location: { directory: session.location.directory } });
+    return servers.data.flatMap((server) => server.status.status === "connected" ? [server.name] : []);
+  } catch {
+    return [];
   }
 }
 
