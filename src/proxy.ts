@@ -1350,6 +1350,15 @@ function handleExecMessage(
     return;
   }
 
+  // Cursor 2026.09.18 adds mcp_state_exec_args as field 36. The checked-in
+  // schema retains it in $unknown until it is regenerated.
+  if (isMcpStateExecRequest(execMsg.$unknown)) {
+    const response = buildMcpStateExecClientMessage(execMsg, mcpTools);
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, response)));
+    sendExecStreamClose(execMsg.id, sendFrame);
+    return;
+  }
+
   // --- Native Cursor tools ---
   // The model tries these before the MCP tools. When the client provides an
   // equivalent tool, redirect the call to it; otherwise reject so the model
@@ -1479,12 +1488,156 @@ function handleExecMessage(
  */
 export function describeUnknownExecFields(
   unknownFields: readonly UnknownField[] | undefined,
-): Array<{ fieldNumber: number; wireType: number; encodedBytes: number }> {
+): Array<{ fieldNumber: number; fieldName?: string; wireType: number; encodedBytes: number }> {
   return (unknownFields ?? []).map((field) => ({
     fieldNumber: field.no,
+    fieldName: cursorExecFieldName(field.no),
     wireType: field.wireType,
     encodedBytes: field.data.length,
   }));
+}
+
+const CURSOR_EXEC_COMPATIBILITY_FIELD = {
+  mcpStateExecArgs: 36,
+  acceptHookAdditionalContexts: 55,
+} as const;
+
+function cursorExecFieldName(fieldNumber: number): string | undefined {
+  switch (fieldNumber) {
+    case CURSOR_EXEC_COMPATIBILITY_FIELD.mcpStateExecArgs:
+      return "mcpStateExecArgs";
+    case CURSOR_EXEC_COMPATIBILITY_FIELD.acceptHookAdditionalContexts:
+      return "acceptHookAdditionalContexts";
+    default:
+      return undefined;
+  }
+}
+
+/** Whether a newer Cursor sent its mcp_state_exec_args oneof field. */
+export function isMcpStateExecRequest(
+  unknownFields: readonly UnknownField[] | undefined,
+): boolean {
+  return unknownFields?.some(
+    (field) => field.no === CURSOR_EXEC_COMPATIBILITY_FIELD.mcpStateExecArgs && field.wireType === 2,
+  ) ?? false;
+}
+
+/**
+ * Build a field-36 mcp_state_exec_result without fabricating a generated
+ * schema. The server and tool definitions are already represented locally;
+ * only the newer outer result oneof is encoded here.
+ */
+export function buildMcpStateExecClientMessage(
+  execMsg: ExecServerMessage,
+  mcpTools: readonly McpToolDefinition[],
+) {
+  const requestedServers = mcpStateServerIdentifiers(execMsg.$unknown);
+  const includeOpenCode = requestedServers !== null &&
+    (requestedServers.length === 0 || requestedServers.includes("opencode"));
+  const servers = includeOpenCode
+    ? [protoLengthDelimitedField(1, concatProtoFields([
+        protoLengthDelimitedField(1, new TextEncoder().encode("OpenCode")),
+        protoLengthDelimitedField(2, new TextEncoder().encode("opencode")),
+        ...mcpTools.map((tool) => protoLengthDelimitedField(5, toBinary(McpToolDefinitionSchema, tool))),
+      ]))]
+    : [];
+  const success = protoLengthDelimitedField(1, concatProtoFields(servers));
+  const clientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  clientMessage.$unknown = [{
+    no: CURSOR_EXEC_COMPATIBILITY_FIELD.mcpStateExecArgs,
+    wireType: 2,
+    data: encodeProtoLengthDelimited(success),
+  }];
+  return create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: clientMessage },
+  });
+}
+
+/**
+ * Decode the requested `server_identifiers` from field-36 args. `null` means
+ * malformed data, which fails closed by advertising no server.
+ */
+function mcpStateServerIdentifiers(
+  unknownFields: readonly UnknownField[] | undefined,
+): string[] | null {
+  const stateField = unknownFields?.find(
+    (field) => field.no === CURSOR_EXEC_COMPATIBILITY_FIELD.mcpStateExecArgs && field.wireType === 2,
+  );
+  if (!stateField) return null;
+  const payload = decodeProtoLengthDelimited(stateField.data);
+  if (!payload) return null;
+
+  const identifiers: string[] = [];
+  let offset = 0;
+  while (offset < payload.value.length) {
+    const tag = decodeProtoVarint(payload.value, offset);
+    if (!tag) return null;
+    offset = tag.nextOffset;
+    if ((tag.value >>> 3) !== 1 || (tag.value & 7) !== 2) return null;
+    const value = decodeProtoLengthDelimited(payload.value, offset);
+    if (!value) return null;
+    identifiers.push(new TextDecoder().decode(value.value));
+    offset = value.nextOffset;
+  }
+  return identifiers;
+}
+
+function decodeProtoLengthDelimited(
+  bytes: Uint8Array,
+  offset = 0,
+): { value: Uint8Array; nextOffset: number } | null {
+  const length = decodeProtoVarint(bytes, offset);
+  if (!length || length.value > bytes.length - length.nextOffset) return null;
+  return {
+    value: bytes.subarray(length.nextOffset, length.nextOffset + length.value),
+    nextOffset: length.nextOffset + length.value,
+  };
+}
+
+function decodeProtoVarint(
+  bytes: Uint8Array,
+  offset: number,
+): { value: number; nextOffset: number } | null {
+  let value = 0;
+  for (let shift = 0; shift < 35; shift += 7) {
+    const byte = bytes[offset++];
+    if (byte === undefined) return null;
+    value |= (byte & 0x7f) << shift;
+    if (!(byte & 0x80)) return { value, nextOffset: offset };
+  }
+  return null;
+}
+
+function concatProtoFields(fields: Uint8Array[]): Uint8Array {
+  const length = fields.reduce((total, field) => total + field.length, 0);
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const field of fields) {
+    result.set(field, offset);
+    offset += field.length;
+  }
+  return result;
+}
+
+function protoLengthDelimitedField(fieldNumber: number, value: Uint8Array): Uint8Array {
+  return concatProtoFields([encodeProtoVarint(fieldNumber << 3 | 2), encodeProtoLengthDelimited(value)]);
+}
+
+function encodeProtoLengthDelimited(value: Uint8Array): Uint8Array {
+  return concatProtoFields([encodeProtoVarint(value.length), value]);
+}
+
+function encodeProtoVarint(value: number): Uint8Array {
+  const bytes: number[] = [];
+  do {
+    const next = value & 0x7f;
+    value >>>= 7;
+    bytes.push(value ? next | 0x80 : next);
+  } while (value);
+  return new Uint8Array(bytes);
 }
 
 /** Build valid typed failures for known execs this proxy cannot provide. */
