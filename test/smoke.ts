@@ -24,6 +24,7 @@ import {
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
 import { unwrapReadOutput } from "../src/native-tools";
+import { MCP_SERVERS_HEADER } from "../src/mcp-servers";
 import { TOOL_ERRORS_HEADER } from "../src/tool-errors";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
@@ -934,6 +935,17 @@ async function testV2Plugin(
         sessionHooks.set(name, callback);
         return { async dispose() {} };
       },
+      async get({ sessionID }: { sessionID: string }) {
+        return { id: sessionID, location: { directory: `/work/${sessionID}` } };
+      },
+    },
+    mcp: {
+      async list({ location }: { location: { directory: string } }) {
+        return { location, data: location.directory !== "/work/errors" ? [] : [
+          { name: "jira", status: { status: "connected" } },
+          { name: "off", status: { status: "failed", error: "down" } },
+        ] };
+      },
     },
     integration: {
       async transform(transform: IntegrationTransform) {
@@ -1004,9 +1016,11 @@ async function testV2Plugin(
   const failedRequest = { sessionID: "errors", kind: "primary", request: nativeRequest() };
   await sessionHooks.get("http.request")!(failedRequest);
   assertEqual((await failedRequest.request.json()).messages[0].is_error, true, "Expected typed V2 failures to survive HTTP serialization");
+  assertEqual(failedRequest.request.headers.get(MCP_SERVERS_HEADER), '["jira"]', "Expected connected V2 MCP servers in the header");
   const otherRequest = { sessionID: "other", kind: "primary", request: nativeRequest() };
   await sessionHooks.get("http.request")!(otherRequest);
   assertEqual((await otherRequest.request.json()).messages[0].is_error, undefined, "Expected errors to remain session scoped");
+  assertEqual(otherRequest.request.headers.get(MCP_SERVERS_HEADER), "[]", "Expected MCP servers from the session's own directory");
   const auxiliaryRequest = { sessionID: "errors", kind: "title", request: nativeRequest() };
   await sessionHooks.get("http.request")!(auxiliaryRequest);
   assertEqual((await auxiliaryRequest.request.json()).messages[0].is_error, undefined, "Expected primary failures not to leak into title requests");
@@ -1216,11 +1230,14 @@ async function testLegacyToolErrorHeaders(modules: TestModules) {
         { type: "tool", callID: "failed", state: { status: "error", error: "permission denied" } },
         { type: "tool", callID: "success", state: { status: "completed", output: "permission denied" } },
       ] }] };
+    } }, mcp: { async status() {
+      return { data: { jira: { status: "connected" }, "my.docs": { status: "connected" }, off: { status: "disabled" } } };
     } } },
   } as any);
   const headers: Record<string, string> = {};
   await hooks["chat.headers"]!({ sessionID: "s", model: { providerID: "cursor" } } as any, { headers });
   assertEqual(headers[TOOL_ERRORS_HEADER], '["failed"]', "Expected only typed legacy failures in the header");
+  assertEqual(headers[MCP_SERVERS_HEADER], '["jira","my_docs"]', "Expected connected legacy MCP servers in the header");
   const unrelated: Record<string, string> = {};
   await hooks["chat.headers"]!({ sessionID: "s", model: { providerID: "other" } } as any, { headers: unrelated });
   assertEqual(requests, 1, "Expected non-Cursor requests not to query session history");

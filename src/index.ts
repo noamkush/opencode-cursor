@@ -18,6 +18,7 @@ import {
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
+import { encodeMcpServerNames, MCP_SERVERS_HEADER } from "./mcp-servers";
 import { TOOL_ERRORS_HEADER } from "./tool-errors";
 
 const CURSOR_PROVIDER_ID = "cursor";
@@ -123,6 +124,18 @@ function buildConfigModels(models: CursorModel[]): ConfigProviderModels {
   );
 }
 
+/** MCP servers connected in this OpenCode instance; empty when unknown. */
+async function connectedMcpServers(input: PluginInput): Promise<string[]> {
+  try {
+    const status = await input.client.mcp.status();
+    return Object.entries(status.data ?? {}).flatMap(([name, server]) =>
+      server.status === "connected" ? [name] : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
  * Register in opencode.json: { "plugin": ["opencode-cursor-oauth"] }
@@ -140,6 +153,7 @@ export const CursorAuthPlugin: Plugin = async (
         part.type === "tool" && part.state.status === "error" ? [part.callID] : [],
       ));
       output.headers[TOOL_ERRORS_HEADER] = JSON.stringify(ids);
+      output.headers[MCP_SERVERS_HEADER] = encodeMcpServerNames(await connectedMcpServers(input));
     },
     /**
      * opencode >= 1.18 builds its provider catalog from config + models.dev
