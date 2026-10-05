@@ -1,4 +1,4 @@
-import { Credential, Integration, Model, Plugin } from "@opencode-ai/plugin";
+import { Credential, Integration, Model, Plugin, Provider } from "@opencode/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -16,9 +16,12 @@ const CURSOR_ID = "cursor";
 const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
 const CURSOR_METHOD_ID = Integration.MethodID.make("cursor-oauth");
 const OPENAI_COMPATIBLE_PACKAGE =
-  "@opencode-ai/ai/providers/openai-compatible";
+  "@opencode/ai/providers/openai-compatible";
 
-interface CatalogState {
+interface ProviderState {
+  readonly connection: NonNullable<
+    Awaited<ReturnType<Plugin.Context["integration"]["connection"]["active"]>>
+  >;
   readonly models: CursorModel[];
   readonly port: number;
 }
@@ -68,49 +71,48 @@ const CursorV2Plugin = Plugin.define({
         },
       });
     });
-    // Setup batches transforms, so apply OAuth refresh before loading the catalog.
+    // Apply OAuth refresh before loading the provider inventory.
     await ctx.integration.reload();
 
-    let catalog = await loadCatalog(ctx);
-    await ctx.catalog.transform((draft) => {
-      const current = catalog;
+    let inventory = await loadInventory(ctx);
+    await ctx.provider.transform((editor) => {
+      const current = inventory;
       if (!current) return;
 
-      draft.provider.update(CURSOR_ID, (provider) => {
-        provider.integrationID = CURSOR_INTEGRATION_ID;
-        provider.name = "Cursor";
-        provider.activation = "auto";
-        provider.package = OPENAI_COMPATIBLE_PACKAGE;
-        provider.settings = {
-          ...provider.settings,
-          baseURL: `http://localhost:${current.port}/v1`,
-        };
-      });
-
-      for (const cursorModel of current.models) {
-        draft.model.update(CURSOR_ID, cursorModel.id, (model) => {
-          model.modelID = Model.ID.make(cursorModel.id);
-          model.name = cursorModel.name;
-          model.capabilities = {
+      const providerID = Provider.ID.make(CURSOR_ID);
+      editor.add({
+        info: {
+          ...Provider.Info.empty(providerID),
+          integrationID: CURSOR_INTEGRATION_ID,
+          name: "Cursor",
+          activation: "auto",
+          package: OPENAI_COMPATIBLE_PACKAGE,
+          settings: { baseURL: `http://localhost:${current.port}/v1` },
+        },
+        models: current.models.map((cursorModel) => ({
+          ...Model.Info.default(providerID, Model.ID.make(cursorModel.id)),
+          name: cursorModel.name,
+          capabilities: {
             tools: true,
             input: ["text"],
             output: ["text"],
-          };
-          model.limit = {
+          },
+          limit: {
             context: cursorModel.contextWindow,
             output: cursorModel.maxTokens,
-          };
-          model.status = "active";
-          model.enabled = true;
-        });
-      }
+          },
+          status: "active",
+          enabled: true,
+        })),
+        sourceConnection: current.connection,
+      });
     });
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
-      catalog = await loadCatalog(ctx);
-      if (!catalog) stopProxy();
-      await ctx.catalog.reload();
+      inventory = await loadInventory(ctx);
+      if (!inventory) stopProxy();
+      await ctx.provider.reload();
     });
 
     return async () => {
@@ -125,14 +127,16 @@ const CursorV2Plugin = Plugin.define({
 
 export default CursorV2Plugin;
 
-async function loadCatalog(
+async function loadInventory(
   ctx: Plugin.Context,
-): Promise<CatalogState | undefined> {
+): Promise<ProviderState | undefined> {
   try {
-    const accessToken = await getAccessToken(ctx);
+    const connection = await ctx.integration.connection.active(CURSOR_ID);
+    if (!connection) return undefined;
+    const accessToken = await resolveAccessToken(ctx, connection);
     const models = await getCursorModels(accessToken);
     const port = await startProxy(() => getAccessToken(ctx), models);
-    return { models, port };
+    return { models, port, connection };
   } catch {
     return undefined;
   }
@@ -142,6 +146,13 @@ async function getAccessToken(ctx: Plugin.Context): Promise<string> {
   const connection = await ctx.integration.connection.active(CURSOR_ID);
   if (!connection) throw new Error("Cursor auth not configured");
 
+  return resolveAccessToken(ctx, connection);
+}
+
+async function resolveAccessToken(
+  ctx: Plugin.Context,
+  connection: ProviderState["connection"],
+): Promise<string> {
   const credential = await ctx.integration.connection.resolve(connection);
   if (!credential || credential.type !== "oauth") {
     throw new Error("Cursor auth not configured");
@@ -161,8 +172,9 @@ function watchConnections(
         if (next.done) return;
         const event = next.value;
         if (
-          event.type === "integration.connection.updated" &&
-          event.data.integrationID === CURSOR_ID
+          event.type === "credential.updated" ||
+          (event.type === "credential.switched" &&
+            event.data.integrationID === CURSOR_ID)
         ) {
           await refresh().catch(() => {});
         }

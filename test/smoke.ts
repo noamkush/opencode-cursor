@@ -17,7 +17,7 @@ import {
   ModelDetailsSchema,
   type AgentServerMessage,
 } from "../src/proto/agent_pb";
-import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
+import { Credential, Integration } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 import {
   GetEffectiveTokenLimitRequestSchema,
@@ -47,8 +47,9 @@ type IntegrationTransform = Parameters<
 >[0];
 type IntegrationDraft = Parameters<IntegrationTransform>[0];
 type IntegrationMethod = Parameters<IntegrationDraft["method"]["update"]>[0];
-type CatalogTransform = Parameters<V2Context["catalog"]["transform"]>[0];
-type CatalogDraft = Parameters<CatalogTransform>[0];
+type ProviderTransform = Parameters<V2Context["provider"]["transform"]>[0];
+type ProviderEditor = Parameters<ProviderTransform>[0];
+type ProviderSource = Parameters<ProviderEditor["add"]>[0];
 
 interface TestCursorBackend {
   apiUrl: string;
@@ -773,8 +774,9 @@ async function testPluginShape(modules: TestModules) {
 async function testV2Plugin(
   modules: TestModules,
   backend: TestCursorBackend,
+  initiallyConnected = false,
 ) {
-  console.log("[test] Checking V2 plugin...");
+  console.log(`[test] Checking V2 plugin (${initiallyConnected ? "signed in" : "signed out"})...`);
   modules.clearModelCache();
   backend.resetObservations();
   backend.setDiscoveryMode("success");
@@ -783,7 +785,8 @@ async function testV2Plugin(
   ]);
 
   let integrationTransform: IntegrationTransform | undefined;
-  let catalogTransform: CatalogTransform | undefined;
+  let providerTransform: ProviderTransform | undefined;
+  let providerSource: ProviderSource | undefined;
   let authMethod: IntegrationMethod | undefined;
   let integrationName: string | undefined;
   let providerPackage: string | undefined;
@@ -816,44 +819,38 @@ async function testV2Plugin(
     },
   };
 
-  const catalogDraft: CatalogDraft = {
-    provider: {
-      list() {
-        return [];
-      },
-      get() {
-        return undefined;
-      },
-      update(id, update) {
-        const provider = Provider.Info.empty(Provider.ID.make(id));
-        update(provider);
-        providerPackage = provider.package;
-        providerIntegrationID = provider.integrationID;
-        providerBaseURL = provider.settings?.baseURL;
-      },
-      remove() {},
+  const providerEditor: ProviderEditor = {
+    list() {
+      return [];
     },
-    model: {
-      get() {
-        return undefined;
-      },
-      update(providerID, modelID, update) {
-        const model = Model.Info.default(
-          Provider.ID.make(providerID),
-          Model.ID.make(modelID),
-        );
-        update(model);
-        modelIDs.push(model.id);
-      },
+    get() {
+      return undefined;
+    },
+    add(source) {
+      providerSource = source;
+      providerPackage = source.info.package;
+      providerIntegrationID = source.info.integrationID;
+      providerBaseURL = source.info.settings?.baseURL;
+      modelIDs.push(...source.models.map((model) => model.id));
+    },
+    update() {},
+    remove() {},
+    models: {
+      set() {},
+      update() {},
       remove() {},
-      default: {
-        get() {
-          return undefined;
-        },
-        set() {},
-      },
     },
   };
+
+  function rebuildProvider(): void {
+    providerSource = undefined;
+    providerPackage = undefined;
+    providerIntegrationID = undefined;
+    providerBaseURL = undefined;
+    modelIDs.length = 0;
+    assert(providerTransform, "Expected V2 provider transform");
+    providerTransform(providerEditor);
+  }
 
   let markReload: (() => void) | undefined;
   let failReload = false;
@@ -863,11 +860,13 @@ async function testV2Plugin(
     return Promise.race([
       pending.promise,
       Bun.sleep(500).then(() => {
-        throw new Error("Expected V2 catalog reload");
+        throw new Error("Expected V2 provider reload");
       }),
     ]);
   }
-  let connected = true;
+  let connected = initiallyConnected;
+  let failResolve = false;
+  let connectionID = "cursor-test";
   let credential = Credential.OAuth.make({
     type: "oauth",
     methodID: Integration.MethodID.make("cursor-oauth"),
@@ -878,27 +877,34 @@ async function testV2Plugin(
   const connectionEvent = {
     id: "cursor-connection-updated",
     created: Date.now(),
-    type: "integration.connection.updated" as const,
-    data: { integrationID: "cursor" },
+    type: "credential.switched" as const,
+    data: { integrationID: "cursor", credentialID: connectionID as string | null },
   };
+  const credentialEvent = {
+    id: "cursor-credential-updated",
+    created: Date.now(),
+    type: "credential.updated" as const,
+    data: {},
+  };
+  type ConnectionEvent = typeof connectionEvent | typeof credentialEvent;
   let eventClosed = false;
-  const eventQueue: Array<typeof connectionEvent> = [];
+  const eventQueue: ConnectionEvent[] = [];
   let sendEvent:
-    | ((result: IteratorResult<typeof connectionEvent>) => void)
+    | ((result: IteratorResult<ConnectionEvent>) => void)
     | undefined;
-  function emitUpdate(): void {
+  function emitUpdate(event: ConnectionEvent = credentialEvent): void {
     if (sendEvent) {
       const send = sendEvent;
       sendEvent = undefined;
-      send({ done: false, value: connectionEvent });
+      send({ done: false, value: event });
       return;
     }
-    eventQueue.push(connectionEvent);
+    eventQueue.push(event);
   }
   const eventStream = {
     [Symbol.asyncIterator]() {
       return {
-        next(): Promise<IteratorResult<typeof connectionEvent>> {
+        next(): Promise<IteratorResult<ConnectionEvent>> {
           if (eventClosed) {
             return Promise.resolve({ done: true, value: undefined });
           }
@@ -910,7 +916,7 @@ async function testV2Plugin(
             sendEvent = resolve;
           });
         },
-        return(): Promise<IteratorResult<typeof connectionEvent>> {
+        return(): Promise<IteratorResult<ConnectionEvent>> {
           eventClosed = true;
           sendEvent?.({ done: true, value: undefined });
           sendEvent = undefined;
@@ -934,11 +940,12 @@ async function testV2Plugin(
           if (!connected) return undefined;
           return {
             type: "credential" as const,
-            id: "cursor-test",
+            id: connectionID,
             label: "Cursor",
           };
         },
         async resolve() {
+          if (failResolve) throw new Error("Injected credential resolution failure");
           if (
             credential.expires <= Date.now() + 5 * 60 * 1000 &&
             authMethod &&
@@ -951,20 +958,19 @@ async function testV2Plugin(
         },
       },
     },
-    catalog: {
-      async transform(transform: CatalogTransform) {
-        catalogTransform = transform;
+    provider: {
+      async transform(transform: ProviderTransform) {
+        providerTransform = transform;
+        rebuildProvider();
         return { async dispose() {} };
       },
       async reload() {
-        modelIDs.length = 0;
-        assert(catalogTransform, "Expected V2 catalog transform");
-        catalogTransform(catalogDraft);
+        rebuildProvider();
         markReload?.();
         markReload = undefined;
         if (failReload) {
           failReload = false;
-          throw new Error("Injected catalog reload failure");
+          throw new Error("Injected provider reload failure");
         }
       },
     },
@@ -975,12 +981,24 @@ async function testV2Plugin(
     },
   };
 
-  // SAFETY: The plugin only reads the integration, catalog, and event domains
-  // supplied by this public-entrypoint harness.
+  // SAFETY: The plugin only reads the integration, provider, and event domains
+  // supplied by this public-entrypoint harness. There is deliberately no catalog.
   const cleanup = await modules.CursorV2Plugin.setup(
     context as unknown as V2Context,
   );
   assert(integrationTransform, "Expected V2 integration transform");
+  if (initiallyConnected) {
+    assert(providerSource, "Expected provider at signed-in startup");
+  } else {
+    assertEqual(providerSource, undefined, "Expected no provider while signed out");
+    assertEqual(modules.getProxyPort(), undefined, "Expected no signed-out proxy");
+    assertEqual(
+      backend.getDiscoveryAuthHeaders().length,
+      0,
+      "Expected no signed-out discovery",
+    );
+  }
+  connected = true;
   failReload = true;
   const failedReload = waitForReload();
   emitUpdate();
@@ -992,7 +1010,7 @@ async function testV2Plugin(
   assertArrayEqual(
     backend.getRefreshAuthHeaders(),
     ["Bearer valid-refresh"],
-    "Expected V2 startup to refresh an expired credential",
+    "Expected V2 to refresh an expired credential",
   );
   const discoveryHeaders = backend.getDiscoveryAuthHeaders();
   assert(
@@ -1019,7 +1037,7 @@ async function testV2Plugin(
   );
   assertEqual(
     providerPackage,
-    "@opencode-ai/ai/providers/openai-compatible",
+    "@opencode/ai/providers/openai-compatible",
     "Expected V2 OpenAI-compatible provider",
   );
   assert(
@@ -1029,8 +1047,33 @@ async function testV2Plugin(
   assertArrayEqual(
     modelIDs.sort(),
     ["auto", "v2-model"],
-    "Expected V2 catalog models",
+    "Expected V2 provider models",
   );
+  function sourceCredentialID(): string | undefined {
+    const connection = providerSource?.sourceConnection;
+    return connection?.type === "credential" ? connection.id : undefined;
+  }
+  assertEqual(
+    sourceCredentialID(),
+    connectionID,
+    "Expected discovery connection binding",
+  );
+  assertEqual(
+    providerSource?.info.activation,
+    "auto",
+    "Expected automatic provider activation",
+  );
+  for (const model of providerSource?.models ?? []) {
+    assertEqual(model.providerID, "cursor", "Expected Cursor model provider");
+    assertEqual(model.modelID, model.id, "Expected upstream model ID");
+    assertEqual(model.capabilities.tools, true, "Expected tool support");
+    assertEqual(model.enabled, true, "Expected enabled models");
+    assertEqual(model.status, "active", "Expected active models");
+    assert(
+      model.limit.context > 0 && model.limit.output > 0,
+      "Expected model limits",
+    );
+  }
 
   const modelsResponse = await fetch(`${providerBaseURL}/models`);
   assertEqual(modelsResponse.status, 200, "Expected V2 proxy model list");
@@ -1063,10 +1106,58 @@ async function testV2Plugin(
     "Expected V2 refresh token request",
   );
 
+  connectionID = "cursor-other-account";
+  backend.setDiscoveredModels([{ id: "other-model", name: "Other Model" }]);
+  const switched = waitForReload();
+  emitUpdate({
+    ...connectionEvent,
+    data: { integrationID: "cursor", credentialID: connectionID },
+  });
+  await switched;
+  assertEqual(
+    sourceCredentialID(),
+    connectionID,
+    "Expected account-switch connection binding",
+  );
+  assertArrayEqual(
+    modelIDs.sort(),
+    ["auto", "other-model"],
+    "Expected account switch to replace inventory",
+  );
+
+  failResolve = true;
+  const unavailable = waitForReload();
+  emitUpdate();
+  await unavailable;
+  assertEqual(
+    providerSource,
+    undefined,
+    "Expected failed credential resolution to remove provider",
+  );
+  assertEqual(
+    modules.getProxyPort(),
+    undefined,
+    "Expected failed credential resolution to stop proxy",
+  );
+  failResolve = false;
+  const recovered = waitForReload();
+  emitUpdate();
+  await recovered;
+  assertArrayEqual(
+    modelIDs.sort(),
+    ["auto", "other-model"],
+    "Expected credential resolution recovery",
+  );
+
   connected = false;
   const stopped = waitForReload();
-  emitUpdate();
+  emitUpdate({
+    ...connectionEvent,
+    data: { integrationID: "cursor", credentialID: null },
+  });
   await stopped;
+  assertEqual(providerSource, undefined, "Expected disconnect to remove provider");
+  assertEqual(modelIDs.length, 0, "Expected disconnect to remove models");
   assertEqual(
     modules.getProxyPort(),
     undefined,
@@ -1075,7 +1166,7 @@ async function testV2Plugin(
 
   assert(typeof cleanup === "function", "Expected V2 cleanup");
   const cleanedUp = await Promise.race([
-    cleanup().then(() => true),
+    Promise.resolve(cleanup()).then(() => true),
     Bun.sleep(500).then(() => false),
   ]);
   assert(cleanedUp, "Expected V2 cleanup to finish");
@@ -1506,6 +1597,7 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testV2Plugin(modules, backend);
+    await testV2Plugin(modules, backend, true);
     await testModelLimitCache(modules, backend);
     await testUsageFromCheckpointAndTokenDelta(modules, backend);
     await testUsageOnToolCallsAndResume(modules, backend);
