@@ -67,6 +67,7 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellStreamSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
@@ -1410,16 +1411,22 @@ export function handleExecMessage(
   }
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
+    const rejected = create(ShellRejectedSchema, {
+      command: args.command ?? "",
+      workingDirectory: args.workingDirectory ?? "",
+      reason: REJECT_REASON,
+      isReadonly: false,
+    });
+    // Cursor's streaming executor ignores shellResult, so sending that variant
+    // would close an empty stream and look like a missing command exit status.
+    if (execCase === "shellStreamArgs") {
+      sendExecResult(execMsg, "shellStream", create(ShellStreamSchema, {
+        event: { case: "rejected", value: rejected },
+      }), sendFrame);
+      return;
+    }
     const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
+      result: { case: "rejected", value: rejected },
     });
     sendExecResult(execMsg, "shellResult", result, sendFrame);
     return;

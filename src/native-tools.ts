@@ -394,12 +394,19 @@ export function redirectNativeExec(
 
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const toolName = pick(["bash"]);
+    // Harnesses may expose either name. Only forward arguments the selected
+    // tool advertises; dropping workdir/timeout would change command semantics.
+    const toolName = ["bash", "shell"].find((name) => {
+      if (!available.has(name)) return false;
+      const properties = inputProperties(mcpTools.find((tool) => (tool.name || tool.toolName) === name));
+      return Object.hasOwn(properties, "command") &&
+        (!args.workingDirectory || Object.hasOwn(properties, "workdir")) &&
+        (!(args.timeout > 0) || Object.hasOwn(properties, "timeout"));
+    });
     if (!toolName) return null;
-    const decodedArgs: Record<string, unknown> = {
-      command: args.command ?? "",
-      description: "Runs shell command",
-    };
+    const properties = inputProperties(mcpTools.find((tool) => (tool.name || tool.toolName) === toolName));
+    const decodedArgs: Record<string, unknown> = { command: args.command ?? "" };
+    if (Object.hasOwn(properties, "description")) decodedArgs.description = "Runs shell command";
     if (args.workingDirectory) decodedArgs.workdir = args.workingDirectory;
     if (args.timeout > 0) decodedArgs.timeout = args.timeout;
     return {
