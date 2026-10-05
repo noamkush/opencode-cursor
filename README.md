@@ -75,6 +75,10 @@ uses Cursor-scoped request hooks; V1 passes failed call IDs from session history
 Failures reach Cursor as their plain message, and a read of a missing file is
 reported as not found so Cursor's write tool can create new files.
 
+Native shell calls can redirect to either `bash` or `shell`, using only arguments
+advertised by that tool. Unavailable streaming-shell calls receive a streaming
+rejection before closing, rather than an unrecognized non-streaming response.
+
 ## Use
 
 Start OpenCode and select any Cursor model. The plugin starts a local
