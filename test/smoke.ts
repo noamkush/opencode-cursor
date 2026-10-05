@@ -8,6 +8,8 @@ import {
   InteractionUpdateSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
+import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
+import type CursorV2PluginModule from "../src/v2";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -18,9 +20,19 @@ interface TestModules {
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
+  CursorV2Plugin: typeof CursorV2PluginModule;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
 }
+
+type V2Context = Parameters<TestModules["CursorV2Plugin"]["setup"]>[0];
+type IntegrationTransform = Parameters<
+  V2Context["integration"]["transform"]
+>[0];
+type IntegrationDraft = Parameters<IntegrationTransform>[0];
+type IntegrationMethod = Parameters<IntegrationDraft["method"]["update"]>[0];
+type CatalogTransform = Parameters<V2Context["catalog"]["transform"]>[0];
+type CatalogDraft = Parameters<CatalogTransform>[0];
 
 interface TestCursorBackend {
   apiUrl: string;
@@ -185,7 +197,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
-        if (discoveryMode === "auth-error") {
+        if (
+          discoveryMode === "auth-error" ||
+          authHeader === "Bearer expired-access"
+        ) {
           stream.respond({
             ":status": 401,
             "content-type": "application/json",
@@ -276,9 +291,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 }
 
 async function loadModules(): Promise<TestModules> {
+  // These imports must run after the test sets the Cursor endpoint environment variables.
   const proxy = await import("../src/proxy");
   const auth = await import("../src/auth");
   const index = await import("../src/index");
+  const v2 = await import("../src/v2");
   const models = await import("../src/models");
   return {
     startProxy: proxy.startProxy,
@@ -287,6 +304,7 @@ async function loadModules(): Promise<TestModules> {
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
+    CursorV2Plugin: v2.default,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
@@ -467,6 +485,324 @@ async function testPluginShape(modules: TestModules) {
   }
 
   console.log("[test] Plugin shape OK");
+}
+
+async function testV2Plugin(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Checking V2 plugin...");
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "v2-model", name: "V2 Model", reasoning: true },
+  ]);
+
+  let integrationTransform: IntegrationTransform | undefined;
+  let catalogTransform: CatalogTransform | undefined;
+  let authMethod: IntegrationMethod | undefined;
+  let integrationName: string | undefined;
+  let providerPackage: string | undefined;
+  let providerIntegrationID: string | undefined;
+  let providerBaseURL: unknown;
+  const modelIDs: string[] = [];
+
+  const integration = { id: "cursor", name: "cursor" };
+  const integrationDraft: IntegrationDraft = {
+    list() {
+      return [integration];
+    },
+    get(id) {
+      return id === integration.id ? integration : undefined;
+    },
+    update(id, update) {
+      assertEqual(id, integration.id, "Expected Cursor integration update");
+      update(integration);
+      integrationName = integration.name;
+    },
+    remove() {},
+    method: {
+      list() {
+        return [];
+      },
+      update(method) {
+        authMethod = method;
+      },
+      remove() {},
+    },
+  };
+
+  const catalogDraft: CatalogDraft = {
+    provider: {
+      list() {
+        return [];
+      },
+      get() {
+        return undefined;
+      },
+      update(id, update) {
+        const provider = Provider.Info.empty(Provider.ID.make(id));
+        update(provider);
+        providerPackage = provider.package;
+        providerIntegrationID = provider.integrationID;
+        providerBaseURL = provider.settings?.baseURL;
+      },
+      remove() {},
+    },
+    model: {
+      get() {
+        return undefined;
+      },
+      update(providerID, modelID, update) {
+        const model = Model.Info.default(
+          Provider.ID.make(providerID),
+          Model.ID.make(modelID),
+        );
+        update(model);
+        modelIDs.push(model.id);
+      },
+      remove() {},
+      default: {
+        get() {
+          return undefined;
+        },
+        set() {},
+      },
+    },
+  };
+
+  let markReload: (() => void) | undefined;
+  let failReload = false;
+  function waitForReload(): Promise<void> {
+    const pending = Promise.withResolvers<void>();
+    markReload = pending.resolve;
+    return Promise.race([
+      pending.promise,
+      Bun.sleep(500).then(() => {
+        throw new Error("Expected V2 catalog reload");
+      }),
+    ]);
+  }
+  let connected = true;
+  let credential = Credential.OAuth.make({
+    type: "oauth",
+    methodID: Integration.MethodID.make("cursor-oauth"),
+    refresh: "valid-refresh",
+    access: "expired-access",
+    expires: Date.now() - 1,
+  });
+  const connectionEvent = {
+    id: "cursor-connection-updated",
+    created: Date.now(),
+    type: "integration.connection.updated" as const,
+    data: { integrationID: "cursor" },
+  };
+  let eventClosed = false;
+  const eventQueue: Array<typeof connectionEvent> = [];
+  let sendEvent:
+    | ((result: IteratorResult<typeof connectionEvent>) => void)
+    | undefined;
+  function emitUpdate(): void {
+    if (sendEvent) {
+      const send = sendEvent;
+      sendEvent = undefined;
+      send({ done: false, value: connectionEvent });
+      return;
+    }
+    eventQueue.push(connectionEvent);
+  }
+  const eventStream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<typeof connectionEvent>> {
+          if (eventClosed) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          const event = eventQueue.shift();
+          if (event) {
+            return Promise.resolve({ done: false, value: event });
+          }
+          return new Promise((resolve) => {
+            sendEvent = resolve;
+          });
+        },
+        return(): Promise<IteratorResult<typeof connectionEvent>> {
+          eventClosed = true;
+          sendEvent?.({ done: true, value: undefined });
+          sendEvent = undefined;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+  const context = {
+    integration: {
+      async transform(transform: IntegrationTransform) {
+        integrationTransform = transform;
+        return { async dispose() {} };
+      },
+      async reload() {
+        assert(integrationTransform, "Expected V2 integration transform");
+        integrationTransform(integrationDraft);
+      },
+      connection: {
+        async active() {
+          if (!connected) return undefined;
+          return {
+            type: "credential" as const,
+            id: "cursor-test",
+            label: "Cursor",
+          };
+        },
+        async resolve() {
+          if (
+            credential.expires <= Date.now() + 5 * 60 * 1000 &&
+            authMethod &&
+            "refresh" in authMethod &&
+            authMethod.refresh
+          ) {
+            credential = await authMethod.refresh(credential);
+          }
+          return credential;
+        },
+      },
+    },
+    catalog: {
+      async transform(transform: CatalogTransform) {
+        catalogTransform = transform;
+        return { async dispose() {} };
+      },
+      async reload() {
+        modelIDs.length = 0;
+        assert(catalogTransform, "Expected V2 catalog transform");
+        catalogTransform(catalogDraft);
+        markReload?.();
+        markReload = undefined;
+        if (failReload) {
+          failReload = false;
+          throw new Error("Injected catalog reload failure");
+        }
+      },
+    },
+    event: {
+      subscribe() {
+        return eventStream;
+      },
+    },
+  };
+
+  // SAFETY: The plugin only reads the integration, catalog, and event domains
+  // supplied by this public-entrypoint harness.
+  const cleanup = await modules.CursorV2Plugin.setup(
+    context as unknown as V2Context,
+  );
+  assert(integrationTransform, "Expected V2 integration transform");
+  failReload = true;
+  const failedReload = waitForReload();
+  emitUpdate();
+  await failedReload;
+
+  const retry = waitForReload();
+  emitUpdate();
+  await retry;
+  assertArrayEqual(
+    backend.getRefreshAuthHeaders(),
+    ["Bearer valid-refresh"],
+    "Expected V2 startup to refresh an expired credential",
+  );
+  const discoveryHeaders = backend.getDiscoveryAuthHeaders();
+  assert(
+    discoveryHeaders.length > 0 &&
+      discoveryHeaders.every((header) => header !== "Bearer expired-access"),
+    `Expected V2 discovery to use refreshed auth, got ${JSON.stringify(discoveryHeaders)}`,
+  );
+
+  assertEqual(
+    modules.CursorV2Plugin.id,
+    "opencode.cursor-oauth",
+    "Expected stable V2 plugin ID",
+  );
+  assertEqual(integrationName, "Cursor", "Expected Cursor integration name");
+  assert(
+    authMethod && "authorize" in authMethod,
+    "Expected Cursor OAuth method",
+  );
+  assertEqual(authMethod.method.type, "oauth", "Expected OAuth method type");
+  assertEqual(
+    providerIntegrationID,
+    "cursor",
+    "Expected Cursor provider integration",
+  );
+  assertEqual(
+    providerPackage,
+    "@opencode-ai/ai/providers/openai-compatible",
+    "Expected V2 OpenAI-compatible provider",
+  );
+  assert(
+    typeof providerBaseURL === "string",
+    "Expected V2 provider base URL",
+  );
+  assertArrayEqual(
+    modelIDs.sort(),
+    ["auto", "v2-model"],
+    "Expected V2 catalog models",
+  );
+
+  const modelsResponse = await fetch(`${providerBaseURL}/models`);
+  assertEqual(modelsResponse.status, 200, "Expected V2 proxy model list");
+  const modelsBody = await modelsResponse.json();
+  assertArrayEqual(
+    modelsBody.data.map((model: { id: string }) => model.id).sort(),
+    ["auto", "v2-model"],
+    "Expected V2 proxy models",
+  );
+
+  assert(authMethod.refresh, "Expected V2 OAuth refresh callback");
+  backend.resetObservations();
+  const refreshed = await authMethod.refresh(
+    Credential.OAuth.make({
+      type: "oauth",
+      methodID: Integration.MethodID.make("cursor-oauth"),
+      refresh: "valid-refresh",
+      access: "expired",
+      expires: Date.now() - 1,
+    }),
+  );
+  assertEqual(
+    refreshed.methodID,
+    Integration.MethodID.make("cursor-oauth"),
+    "Expected refreshed V2 credential method",
+  );
+  assertArrayEqual(
+    backend.getRefreshAuthHeaders(),
+    ["Bearer valid-refresh"],
+    "Expected V2 refresh token request",
+  );
+
+  connected = false;
+  const stopped = waitForReload();
+  emitUpdate();
+  await stopped;
+  assertEqual(
+    modules.getProxyPort(),
+    undefined,
+    "Expected V2 disconnect to stop the proxy",
+  );
+
+  assert(typeof cleanup === "function", "Expected V2 cleanup");
+  const cleanedUp = await Promise.race([
+    cleanup().then(() => true),
+    Bun.sleep(500).then(() => false),
+  ]);
+  assert(cleanedUp, "Expected V2 cleanup to finish");
+  assert(eventClosed, "Expected V2 cleanup to close the event stream");
+  assertEqual(
+    modules.getProxyPort(),
+    undefined,
+    "Expected V2 cleanup to stop the proxy",
+  );
+  console.log("[test] V2 plugin OK");
 }
 
 async function testArrayContentParsing(modules: TestModules) {
@@ -651,6 +987,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
