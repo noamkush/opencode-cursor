@@ -6,6 +6,7 @@ import {
   bindReadOutput,
   redirectNativeExec,
   sendNativeExecResult,
+  unwrapReadOutput,
   type NativeExecBinding,
 } from "../src/native-tools";
 import {
@@ -146,5 +147,81 @@ describe("native read results", () => {
     expect(success.totalLines).toBe(2);
     expect(success.truncated).toBe(false);
     expect(sendRead({ resultType: "readResult", args: { path: file, offset: "101" } }, "a\nb").totalLines).toBe(102);
+  });
+});
+
+/** Text the V2 read tool returns, as built by its toModelContent. */
+function v2Output(path: string, first: number, lines: readonly string[], next?: number) {
+  return [
+    lines.length === 0 ? `Read file ${path}, 0 lines` : `Read file ${path}, lines ${first}-${first + lines.length - 1}`,
+    ...lines.map((line, index) => `${first + index}: ${line}`),
+    ...(next === undefined ? [] : [`[Output truncated. Continue reading with offset: ${next}]`]),
+  ].join("\n");
+}
+
+/** Mirror the proxy: bind totals, then unwrap, keeping the footer only when the read was cut short. */
+function nativeRead(binding: NativeExecBinding, output: string) {
+  const bound = bindReadOutput(binding, output);
+  return sendRead(bound, unwrapReadOutput(output, { keepFooter: bound.args.truncated === "true" }));
+}
+
+describe("OpenCode V2 read output", () => {
+  test("strips the header and line numbers from a whole-file read", () => {
+    const success = nativeRead(redirect(file).binding, v2Output("src/a.ts", 1, ["const a = 1", "", "1: literal"]));
+    expect(success.output).toEqual({ case: "content", value: "const a = 1\n\n1: literal" });
+    expect(success.totalLines).toBe(3);
+    expect(success.fileSize).toBe(0n);
+    expect(success.truncated).toBe(false);
+    expect(success.$unknown ?? []).toEqual([]);
+  });
+
+  test("reports the end of a ranged read that reached the end of the file", () => {
+    const success = nativeRead(redirect(file, { offset: 3, limit: 10 }).binding, v2Output("src/a.ts", 3, ["c", "d"]));
+    expect(success.output).toEqual({ case: "content", value: "c\nd" });
+    expect(success.totalLines).toBe(4);
+    expect(success.truncated).toBe(false);
+    expect(success.$unknown).toEqual([{ no: 8, wireType: WireType.Varint, data: new Uint8Array([1]) }]);
+  });
+
+  test("reports a lower bound and keeps continuation guidance for cut-off pages", () => {
+    const success = nativeRead(redirect(file, { offset: 101, limit: 2 }).binding, v2Output("src/a.ts", 101, ["x", "y"], 103));
+    expect(success.output).toEqual({
+      case: "content",
+      value: "x\ny\n\n(Showing lines 101-102. Total line count is unknown. Use offset=103 to continue.)",
+    });
+    expect(success.totalLines).toBe(103);
+    expect(success.truncated).toBe(true);
+    expect(success.$unknown).toEqual([{ no: 8, wireType: WireType.Varint, data: new Uint8Array([1]) }]);
+  });
+
+  test("marks implicit first pages of large files as already ranged", () => {
+    const success = nativeRead(redirect(file).binding, v2Output("src/a.ts", 1, ["a", "b"], 3));
+    expect(success.totalLines).toBe(3);
+    expect(success.truncated).toBe(true);
+    expect(success.$unknown).toEqual([{ no: 8, wireType: WireType.Varint, data: new Uint8Array([1]) }]);
+  });
+
+  test("handles empty files and shortened lines", () => {
+    expect(nativeRead(redirect(file).binding, v2Output("src/empty.ts", 1, []))).toMatchObject({
+      output: { case: "content", value: "" }, totalLines: 0, truncated: false,
+    });
+    const long = `${"x".repeat(2000)}... (line truncated to 2000 chars)`;
+    expect(nativeRead(redirect(file).binding, v2Output("src/a.ts", 1, [long])).truncated).toBe(true);
+  });
+
+  test("keeps the end-of-file footer for direct MCP reads", () => {
+    expect(unwrapReadOutput(v2Output("src/a.ts", 5, ["e"]), { keepFooter: true })).toBe("e\n\n(Showing lines 5-5. End of file.)");
+  });
+
+  test("leaves output that does not match the read format untouched", () => {
+    for (const output of [
+      "Read file src/a.ts, lines 1-2\n1: a\n3: c",
+      "Read file src/a.ts, lines 1-1\n1: a\nextra",
+      "Read file src/a.ts, lines 1-3\n1: a",
+      "Read directory src, entries 1-2\na.ts\nb.ts",
+    ]) {
+      expect(unwrapReadOutput(output, { keepFooter: true })).toBe(output);
+      expect(bindReadOutput(redirect(file).binding, output).args.totalLines).toBeUndefined();
+    }
   });
 });
