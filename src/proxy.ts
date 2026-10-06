@@ -73,6 +73,7 @@ import {
   normalizeToolArgs,
   redirectNativeExec,
   sendNativeExecResult,
+  unwrapReadOutput,
   type NativeExecBinding,
 } from "./native-tools";
 import { createHash } from "node:crypto";
@@ -1906,6 +1907,7 @@ function handleToolResultResume(
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
     let text = result.content;
+    if (exec.toolName === "read") text = unwrapReadOutput(text, { keepFooter: !exec.native });
     if (DEBUG) {
       debugLog("exec.result_received", {
         bridgeKey,
