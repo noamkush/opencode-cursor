@@ -80,6 +80,7 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { buildInteractionResponse } from "./interaction-query";
+import { decodeToolErrorIds, markToolErrors, TOOL_ERRORS_HEADER, toolErrorText } from "./tool-errors";
 import {
   bindReadOutput,
   normalizeToolArgs,
@@ -572,7 +573,8 @@ export async function startProxy(
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         try {
-          const body = (await req.json()) as ChatCompletionRequest;
+          const request = await markToolErrors(req, decodeToolErrorIds(req.headers.get(TOOL_ERRORS_HEADER)));
+          const body = (await request.json()) as ChatCompletionRequest;
           if (!proxyAccessTokenProvider) {
             throw new Error("Cursor proxy access token provider not configured");
           }
@@ -723,7 +725,7 @@ function textContent(content: OpenAIMessage["content"]): string {
     .join("\n");
 }
 
-function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
+export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   const systemPrompts = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content))
@@ -2073,7 +2075,7 @@ function handleToolResultResume(
     // after rejecting an edit) would otherwise be dropped: the paused bridge
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
-    let text = result.content;
+    let text = result.isError ? toolErrorText(result.content) : result.content;
     let native = exec.native;
     if (exec.toolName === "read") {
       if (native && !result.isError) native = bindReadOutput(native, text);

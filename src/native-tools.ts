@@ -33,6 +33,7 @@ import {
   LsSuccessSchema,
   ReadResultSchema,
   ReadErrorSchema,
+  ReadFileNotFoundSchema,
   ReadSuccessSchema,
   ShellFailureSchema,
   ShellResultSchema,
@@ -171,6 +172,7 @@ const END_OF_FILE_FOOTER = /\(End of file - total (\d+) lines\)/;
 const PARTIAL_FOOTER = /\(Showing lines (\d+)-(\d+) of (\d+)\./;
 const CAPPED_FOOTER = /\(Output capped at [^.]+\. Showing lines (\d+)-(\d+)\./;
 const LONG_LINE_SUFFIX = /\.\.\. \(line truncated to \d+ chars\)$/m;
+const READ_FILE_NOT_FOUND = /^File not found: /;
 const V2_READ_HEADER = /^Read file .+, (?:0 lines|lines (\d+)-(\d+))$/;
 const V2_READ_TRUNCATED = /^\[Output truncated\. Continue reading with offset: (\d+)\]$/;
 
@@ -510,11 +512,12 @@ export function sendNativeExecResult(
   switch (binding.resultType) {
     case "readResult": {
       if (isError) {
+        // Cursor reads a file before writing it and treats only fileNotFound
+        // as a new file; a generic error aborts the write.
         sendExec("readResult", create(ReadResultSchema, {
-          result: {
-            case: "error",
-            value: create(ReadErrorSchema, { path: args.path ?? "", error: text || "Read failed" }),
-          },
+          result: READ_FILE_NOT_FOUND.test(text)
+            ? { case: "fileNotFound", value: create(ReadFileNotFoundSchema, { path: args.path ?? "" }) }
+            : { case: "error", value: create(ReadErrorSchema, { path: args.path ?? "", error: text || "Read failed" }) },
         }));
         return true;
       }
