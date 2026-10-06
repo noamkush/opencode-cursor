@@ -12,7 +12,7 @@
  * switch each call site to the generated field and delete its constant.
  */
 import type { UnknownField } from "@bufbuild/protobuf";
-import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
+import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 
 /**
  * `InteractionQuery.web_fetch_request_query` (query) and
@@ -21,6 +21,22 @@ import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
  */
 export const INTERACTION_WEB_FETCH_FIELD = 9;
 
+/**
+ * `ReadArgs.offset`, an optional varint int32. 1-based start line; a
+ * negative value counts back from the end of the file.
+ */
+export const READ_ARGS_OFFSET_FIELD = 4;
+
+/** `ReadArgs.limit`, an optional varint uint32 line count. */
+export const READ_ARGS_LIMIT_FIELD = 5;
+
+/**
+ * `ReadSuccess.range_applied`, a varint bool. When false, Cursor applies the
+ * requested offset and limit to the returned content itself, so it must be
+ * true whenever the client already returned only the requested range.
+ */
+export const READ_SUCCESS_RANGE_APPLIED_FIELD = 8;
+
 /** Find an unknown field by number and wire type. */
 export function findUnknownField(
   fields: readonly UnknownField[] | undefined,
@@ -28,6 +44,42 @@ export function findUnknownField(
   wireType: WireType,
 ): UnknownField | undefined {
   return fields?.find((field) => field.no === no && field.wireType === wireType);
+}
+
+/** Read a varint int32 field. The last occurrence wins, as for any proto scalar. */
+export function readUnknownInt32(
+  fields: readonly UnknownField[] | undefined,
+  no: number,
+): number | undefined {
+  return readLastVarint(fields, no, (reader) => reader.int32());
+}
+
+/** Read a varint uint32 field. The last occurrence wins, as for any proto scalar. */
+export function readUnknownUint32(
+  fields: readonly UnknownField[] | undefined,
+  no: number,
+): number | undefined {
+  return readLastVarint(fields, no, (reader) => reader.uint32());
+}
+
+function readLastVarint(
+  fields: readonly UnknownField[] | undefined,
+  no: number,
+  read: (reader: BinaryReader) => number,
+): number | undefined {
+  const matches = fields?.filter((field) => field.no === no && field.wireType === WireType.Varint);
+  const field = matches?.[matches.length - 1];
+  if (!field) return undefined;
+  try {
+    return read(new BinaryReader(field.data));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Encode a varint bool unknown field. */
+export function unknownBoolField(no: number, value: boolean): UnknownField {
+  return { no, wireType: WireType.Varint, data: new BinaryWriter().bool(value).finish() };
 }
 
 /** Encode `message` (already serialized) as a length-delimited unknown field. */
