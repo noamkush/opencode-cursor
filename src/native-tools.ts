@@ -171,6 +171,8 @@ const END_OF_FILE_FOOTER = /\(End of file - total (\d+) lines\)/;
 const PARTIAL_FOOTER = /\(Showing lines (\d+)-(\d+) of (\d+)\./;
 const CAPPED_FOOTER = /\(Output capped at [^.]+\. Showing lines (\d+)-(\d+)\./;
 const LONG_LINE_SUFFIX = /\.\.\. \(line truncated to \d+ chars\)$/m;
+const V2_READ_HEADER = /^Read file .+, (?:0 lines|lines (\d+)-(\d+))$/;
+const V2_READ_TRUNCATED = /^\[Output truncated\. Continue reading with offset: (\d+)\]$/;
 
 /** Strip Read line numbers only when every nonempty line is numbered output. */
 function stripReadLinePrefixes(text: string): string {
@@ -187,19 +189,52 @@ function stripReadLinePrefixes(text: string): string {
 }
 
 /**
- * Convert OpenCode Read output to plain file content. Unwraps one
- * `<path>`, `<type>file</type>`, `<content>` envelope, strips numbered
- * prefixes from the inner lines, and drops the Read footer unless
- * `keepFooter` is set. The footer is the only sign that a read stopped
- * early, so results shown to the model should keep it.
+ * Convert OpenCode Read output to plain file content. Unwraps one V1
+ * `<path>`, `<type>file</type>`, `<content>` envelope or a V2
+ * `Read file ..., lines a-b` page, strips numbered prefixes from the
+ * lines, and drops the Read footer unless `keepFooter` is set. The footer
+ * is the only sign that a read stopped early, so results shown to the
+ * model should keep it.
  */
 export function unwrapReadOutput(
   text: string,
   options: { keepFooter?: boolean } = {},
 ): string {
   const parsed = parseReadEnvelope(text);
-  if (!parsed) return text;
+  if (!parsed) {
+    const page = parseReadPage(text);
+    if (!page) return text;
+    if (!options.keepFooter || page.last === 0) return page.content;
+    const continuation = page.next === undefined
+      ? " End of file."
+      : ` Total line count is unknown. Use offset=${page.next} to continue.`;
+    return `${page.content}\n\n(Showing lines ${page.first}-${page.last}.${continuation})`;
+  }
   return options.keepFooter && parsed.footer ? parsed.content + parsed.footer : parsed.content;
+}
+
+/** Parse V2 Read text only when every line has the exact expected shape. */
+function parseReadPage(text: string) {
+  const lines = text.split("\n");
+  const header = lines[0]!.match(V2_READ_HEADER);
+  if (!header) return null;
+  const first = header[1] ? Number(header[1]) : 1;
+  const last = header[2] ? Number(header[2]) : 0;
+  const count = header[1] ? last - first + 1 : 0;
+  if (count < 0 || lines.length < count + 1) return null;
+  const content: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const prefix = `${first + index}: `;
+    const line = lines[index + 1]!;
+    if (!line.startsWith(prefix)) return null;
+    content.push(line.slice(prefix.length));
+  }
+  const rest = lines.slice(count + 1);
+  while (rest.at(-1) === "") rest.pop();
+  if (rest.length > 1) return null;
+  const truncated = rest[0]?.match(V2_READ_TRUNCATED);
+  if (rest.length === 1 && !truncated) return null;
+  return { content: content.join("\n"), first, last, next: truncated ? Number(truncated[1]) : undefined };
 }
 
 function parseReadEnvelope(text: string) {
@@ -224,6 +259,21 @@ function textLineCount(text: string): number {
  * file. Missing totals remain unknown; this layer must not open local files.
  */
 export function bindReadOutput(binding: NativeExecBinding, output: string): NativeExecBinding {
+  const page = parseReadPage(output);
+  if (page) {
+    // V2 does not report the file's total. A page without a continuation
+    // reached the end of the file; otherwise line `next` is known to exist.
+    return {
+      ...binding,
+      args: {
+        ...binding.args,
+        totalLines: String(page.next ?? page.last),
+        fileSize: "0",
+        truncated: String(page.next !== undefined || LONG_LINE_SUFFIX.test(page.content)),
+        ...(page.next !== undefined || page.first !== 1 ? { rangeApplied: "true" } : undefined),
+      },
+    };
+  }
   const parsed = parseReadEnvelope(output);
   if (!parsed) return binding;
   const args = binding.args;
