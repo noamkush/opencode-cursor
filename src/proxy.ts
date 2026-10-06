@@ -81,6 +81,7 @@ import {
 } from "./proto/agent_pb";
 import { buildInteractionResponse } from "./interaction-query";
 import {
+  bindReadOutput,
   normalizeToolArgs,
   redirectNativeExec,
   sendNativeExecResult,
@@ -1366,7 +1367,10 @@ export function handleExecMessage(
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
     const result = create(ReadResultSchema, {
-      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+      result: { case: "rejected", value: create(ReadRejectedSchema, {
+        path: args.path,
+        reason: "This native read cannot be represented by the advertised read schema. Use the MCP read tool with a positive offset and its declared path argument instead.",
+      }) },
     });
     sendExecResult(execMsg, "readResult", result, sendFrame);
     return;
@@ -2070,7 +2074,11 @@ function handleToolResultResume(
     // only accepts tool results. Attach it to the last result so the model
     // sees it (issue #23).
     let text = result.content;
-    if (exec.toolName === "read") text = unwrapReadOutput(text, { keepFooter: !exec.native });
+    let native = exec.native;
+    if (exec.toolName === "read") {
+      if (native && !result.isError) native = bindReadOutput(native, text);
+      if (!result.isError) text = unwrapReadOutput(text, { keepFooter: !native || native.args.truncated === "true" });
+    }
     if (DEBUG) {
       debugLog("exec.result_received", {
         bridgeKey,
@@ -2083,8 +2091,8 @@ function handleToolResultResume(
       text += `\n\n<user_message>\n${userText}\n</user_message>`;
     }
 
-    if (exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, result.isError, (bytes) => {
+    if (native) {
+      const sent = sendNativeExecResult(exec, native, text, result.isError, (bytes) => {
         const frame = frameConnectMessage(bytes);
         if (DEBUG) {
           debugLog("exec.result_frame", {
@@ -2092,6 +2100,8 @@ function handleToolResultResume(
             execId: exec.execId,
             toolName: exec.toolName,
             type: "native",
+            resultType: native.resultType,
+            nativeArgs: native.args,
             ...contentDiagnostics(text),
             nativeResultBytes: bytes.length,
             connectFrameBytes: frame.length,

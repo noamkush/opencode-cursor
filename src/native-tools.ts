@@ -49,6 +49,14 @@ import {
   type LsDirectoryTreeNode,
   type McpToolDefinition,
 } from "./proto/agent_pb";
+import {
+  READ_ARGS_LIMIT_FIELD,
+  READ_ARGS_OFFSET_FIELD,
+  READ_SUCCESS_RANGE_APPLIED_FIELD,
+  readUnknownInt32,
+  readUnknownUint32,
+  unknownBoolField,
+} from "./unknown-fields";
 
 export type NativeResultType =
   | "readResult"
@@ -159,6 +167,10 @@ const READ_FOOTER =
   /\n\n\((?:End of file - total \d+ lines|Showing lines .+|Output capped at .+)\)\s*$/;
 const FILE_ENVELOPE =
   /^(?:\s*)<path>[\s\S]*?<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n<\/content>/;
+const END_OF_FILE_FOOTER = /\(End of file - total (\d+) lines\)/;
+const PARTIAL_FOOTER = /\(Showing lines (\d+)-(\d+) of (\d+)\./;
+const CAPPED_FOOTER = /\(Output capped at [^.]+\. Showing lines (\d+)-(\d+)\./;
+const LONG_LINE_SUFFIX = /\.\.\. \(line truncated to \d+ chars\)$/m;
 
 /** Strip Read line numbers only when every nonempty line is numbered output. */
 function stripReadLinePrefixes(text: string): string {
@@ -185,12 +197,65 @@ export function unwrapReadOutput(
   text: string,
   options: { keepFooter?: boolean } = {},
 ): string {
+  const parsed = parseReadEnvelope(text);
+  if (!parsed) return text;
+  return options.keepFooter && parsed.footer ? parsed.content + parsed.footer : parsed.content;
+}
+
+function parseReadEnvelope(text: string) {
   const match = text.match(FILE_ENVELOPE);
-  if (!match) return text;
+  if (!match) return null;
   const inner = match[1]!;
   const footer = inner.match(READ_FOOTER);
-  const content = stripReadLinePrefixes(footer ? inner.slice(0, footer.index) : inner);
-  return options.keepFooter && footer ? content + footer[0] : content;
+  return {
+    content: stripReadLinePrefixes(footer ? inner.slice(0, footer.index) : inner),
+    footer: footer?.[0],
+  };
+}
+
+function textLineCount(text: string): number {
+  if (!text) return 0;
+  return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+}
+
+/**
+ * Record what an OpenCode read actually returned so the native readResult
+ * reports known totals rather than treating the returned chunk as the whole
+ * file. Missing totals remain unknown; this layer must not open local files.
+ */
+export function bindReadOutput(binding: NativeExecBinding, output: string): NativeExecBinding {
+  const parsed = parseReadEnvelope(output);
+  if (!parsed) return binding;
+  const args = binding.args;
+  const footer = parsed.footer ?? "";
+  const limit = args.limit ? Number(args.limit) : undefined;
+
+  let totalLines: number | undefined;
+  let truncated = LONG_LINE_SUFFIX.test(parsed.content);
+  const end = footer.match(END_OF_FILE_FOOTER);
+  const partial = footer.match(PARTIAL_FOOTER);
+  const capped = footer.match(CAPPED_FOOTER);
+  if (end) {
+    totalLines = Number(end[1]);
+  } else if (partial) {
+    totalLines = Number(partial[3]);
+    const [first, last] = [Number(partial[1]), Number(partial[2])];
+    truncated ||= limit === undefined || last < first + limit - 1;
+  } else if (capped) {
+    // The total is unknown, but the next line exists.
+    totalLines = Number(capped[2]) + 1;
+    truncated = true;
+  }
+
+  return {
+    ...binding,
+    args: {
+      ...args,
+      ...(totalLines !== undefined ? { totalLines: String(totalLines) } : undefined),
+      fileSize: "0",
+      ...(truncated ? { truncated: "true" } : undefined),
+    },
+  };
 }
 
 /**
@@ -212,13 +277,29 @@ export function redirectNativeExec(
     const args = execMsg.message.value;
     const toolName = pick(["read"]);
     if (!toolName) return null;
-    const key = filePathKey(mcpTools.find((tool) => (tool.name || tool.toolName) === toolName));
+    const tool = mcpTools.find((tool) => (tool.name || tool.toolName) === toolName);
+    const key = filePathKey(tool);
     if (!key) return null;
+    // OpenCode cannot express EOF-relative offsets. Reject rather than
+    // silently reading a capped first page or bypassing tool permissions.
+    const offset = readUnknownInt32(args.$unknown, READ_ARGS_OFFSET_FIELD);
+    if ((offset ?? 0) < 0) return null;
+    const limit = readUnknownUint32(args.$unknown, READ_ARGS_LIMIT_FIELD);
+    const range = { ...(offset ? { offset } : undefined), ...(limit ? { limit } : undefined) };
+    const properties = inputProperties(tool);
+    if (Object.keys(range).some((field) => !Object.hasOwn(properties, field))) return null;
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
-      decodedArgs: JSON.stringify({ [key]: args.path ?? "" }),
-      binding: { resultType: "readResult", args: { path: args.path ?? "" } },
+      decodedArgs: JSON.stringify({ [key]: args.path ?? "", ...range }),
+      binding: {
+        resultType: "readResult",
+        args: {
+          path: args.path ?? "",
+          ...(range.offset ? { offset: String(range.offset) } : undefined),
+          ...(range.limit ? { limit: String(range.limit) } : undefined),
+        },
+      },
     };
   }
 
@@ -387,20 +468,22 @@ export function sendNativeExecResult(
         }));
         return true;
       }
+      // Cursor checks offsets against totalLines, so an unknown total must
+      // still cover every line returned.
+      const offset = args.offset ? Number(args.offset) : 1;
+      const success = create(ReadSuccessSchema, {
+        path: args.path ?? "",
+        totalLines: args.totalLines !== undefined ? Number(args.totalLines) : offset - 1 + textLineCount(text),
+        fileSize: BigInt(args.fileSize ?? 0),
+        truncated: args.truncated === "true",
+        output: { case: "content", value: text },
+      });
+      if (args.rangeApplied === "true" || args.offset || args.limit) {
+        success.$unknown = [unknownBoolField(READ_SUCCESS_RANGE_APPLIED_FIELD, true)];
+      }
       sendExec(
         "readResult",
-        create(ReadResultSchema, {
-          result: {
-            case: "success",
-            value: create(ReadSuccessSchema, {
-              path: args.path ?? "",
-              totalLines: text.split("\n").length,
-              fileSize: BigInt(new TextEncoder().encode(text).byteLength),
-              truncated: false,
-              output: { case: "content", value: text },
-            }),
-          },
-        }),
+        create(ReadResultSchema, { result: { case: "success", value: success } }),
       );
       return true;
     }

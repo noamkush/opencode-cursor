@@ -59,6 +59,12 @@ Cursor's tool-argument names are renamed to the names each OpenCode tool
 advertises (`filePath` in OpenCode V1, `path` in V2), and only when that name
 is unambiguous. Write and edit content is passed through literally.
 
+Native reads forward positive offsets and limits. EOF-relative negative offsets
+are rejected so Cursor can retry using the MCP read tool, without the proxy
+opening files outside OpenCode's permission boundary. Cut-off reads keep their
+continuation guidance; when a file's full line count or size is unavailable,
+the proxy reports a lower bound or unknown.
+
 ## Use
 
 Start OpenCode and select any Cursor model. The plugin starts a local
