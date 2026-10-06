@@ -146,6 +146,46 @@ export function normalizeToolArgs(
   return args;
 }
 
+const OPENCODE_READ_PREFIX = /^\d+: /;
+const CURSOR_READ_PREFIX = /^\s*\d+\|/;
+const READ_FOOTER =
+  /\n\n\((?:End of file - total \d+ lines|Showing lines .+|Output capped at .+)\)\s*$/;
+const FILE_ENVELOPE =
+  /^(?:\s*)<path>[\s\S]*?<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n<\/content>/;
+
+/** Strip Read line numbers only when every nonempty line is numbered output. */
+function stripReadLinePrefixes(text: string): string {
+  const lines = text.split("\n");
+  const nonempty = lines.filter((line) => line.length > 0);
+  if (nonempty.length === 0) return text;
+  if (nonempty.every((line) => OPENCODE_READ_PREFIX.test(line))) {
+    return lines.map((line) => line.replace(OPENCODE_READ_PREFIX, "")).join("\n");
+  }
+  if (nonempty.every((line) => CURSOR_READ_PREFIX.test(line))) {
+    return lines.map((line) => line.replace(CURSOR_READ_PREFIX, "")).join("\n");
+  }
+  return text;
+}
+
+/**
+ * Convert OpenCode Read output to plain file content. Unwraps one
+ * `<path>`, `<type>file</type>`, `<content>` envelope, strips numbered
+ * prefixes from the inner lines, and drops the Read footer unless
+ * `keepFooter` is set. The footer is the only sign that a read stopped
+ * early, so results shown to the model should keep it.
+ */
+export function unwrapReadOutput(
+  text: string,
+  options: { keepFooter?: boolean } = {},
+): string {
+  const match = text.match(FILE_ENVELOPE);
+  if (!match) return text;
+  const inner = match[1]!;
+  const footer = inner.match(READ_FOOTER);
+  const content = stripReadLinePrefixes(footer ? inner.slice(0, footer.index) : inner);
+  return options.keepFooter && footer ? content + footer[0] : content;
+}
+
 /**
  * Map a native exec request onto a client-provided OpenAI tool.
  * Returns null when no equivalent tool is available (caller rejects as before).

@@ -18,6 +18,7 @@ import {
   GetEffectiveTokenLimitRequestSchema,
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
+import { unwrapReadOutput } from "../src/native-tools";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -354,6 +355,99 @@ async function loadModules(): Promise<TestModules> {
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
+}
+
+function opencodeReadOutput(path: string, lines: readonly string[], footer: string): string {
+  return [
+    `<path>${path}</path>`,
+    "<type>file</type>",
+    "<content>",
+    ...lines.map((line, index) => `${index + 1}: ${line}`),
+    "",
+    footer,
+    "</content>",
+  ].join("\n");
+}
+
+function testUnwrapReadOutput() {
+  console.log("[test] unwrapReadOutput...");
+  const lines = ["import abc", "import logging"];
+  const envelope = opencodeReadOutput(
+    "/tmp/a.py",
+    lines,
+    "(End of file - total 2 lines)",
+  );
+  assertEqual(
+    unwrapReadOutput(envelope),
+    lines.join("\n"),
+    "Expected a file envelope to unwrap to raw content",
+  );
+
+  const nested = opencodeReadOutput(
+    "/tmp/a.py",
+    envelope.split("\n"),
+    "(End of file - total 8 lines)",
+  );
+  assertEqual(
+    unwrapReadOutput(nested),
+    envelope,
+    "Expected a nested envelope to unwrap one layer",
+  );
+
+  assertEqual(
+    unwrapReadOutput("plain text"),
+    "plain text",
+    "Expected non-envelope text to pass through",
+  );
+  assertEqual(
+    unwrapReadOutput(["12: const x = 1", "13: const y = 2"].join("\n")),
+    ["12: const x = 1", "13: const y = 2"].join("\n"),
+    "Expected bare numbered content to remain literal",
+  );
+  assertEqual(
+    unwrapReadOutput(["  12|foo", "  13|bar"].join("\n")),
+    ["  12|foo", "  13|bar"].join("\n"),
+    "Expected bare pipe-numbered content to remain literal",
+  );
+  assertEqual(
+    unwrapReadOutput(["1: still real content", "const x = 1"].join("\n")),
+    ["1: still real content", "const x = 1"].join("\n"),
+    "Expected mixed lines to keep Read-like prefixes",
+  );
+  assertEqual(
+    unwrapReadOutput(
+      opencodeReadOutput(
+        "/tmp/a.py",
+        lines,
+        "(Showing lines 1-2 of 10. Use offset=3 to continue.)",
+      ),
+    ),
+    lines.join("\n"),
+    "Expected truncation footer to be dropped",
+  );
+  assertEqual(
+    unwrapReadOutput(
+      opencodeReadOutput(
+        "/tmp/a.py",
+        lines,
+        "(Showing lines 1-2 of 10. Use offset=3 to continue.)",
+      ),
+      { keepFooter: true },
+    ),
+    `${lines.join("\n")}\n\n(Showing lines 1-2 of 10. Use offset=3 to continue.)`,
+    "Expected keepFooter to strip line numbers but keep the truncation footer",
+  );
+  assertEqual(
+    unwrapReadOutput(envelope, { keepFooter: true }),
+    `${lines.join("\n")}\n\n(End of file - total 2 lines)`,
+    "Expected keepFooter to keep the end-of-file footer",
+  );
+  assertEqual(
+    unwrapReadOutput(`${envelope}\n\n<system-reminder>\nnote\n</system-reminder>`),
+    lines.join("\n"),
+    "Expected system-reminder after the envelope to be dropped",
+  );
+  console.log("[test] unwrapReadOutput OK");
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -1159,6 +1253,7 @@ async function main() {
   const modules = await loadModules();
 
   try {
+    testUnwrapReadOutput();
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
     testHeartbeatClassification(modules);
