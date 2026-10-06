@@ -24,6 +24,7 @@ import {
   GetEffectiveTokenLimitResponseSchema,
 } from "../src/proto/aiserver_pb";
 import { unwrapReadOutput } from "../src/native-tools";
+import { TOOL_ERRORS_HEADER } from "../src/tool-errors";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -925,7 +926,15 @@ async function testV2Plugin(
       };
     },
   };
+  const sessionHooks = new Map<string, (event: any) => void | Promise<void>>();
   const context = {
+    session: {
+      async hook(name: string, callback: (event: any) => void | Promise<void>, options: { providerID?: string }) {
+        assertEqual(options.providerID, "cursor", "Expected Cursor-scoped error hooks");
+        sessionHooks.set(name, callback);
+        return { async dispose() {} };
+      },
+    },
     integration: {
       async transform(transform: IntegrationTransform) {
         integrationTransform = transform;
@@ -986,6 +995,25 @@ async function testV2Plugin(
   const cleanup = await modules.CursorV2Plugin.setup(
     context as unknown as V2Context,
   );
+  const toolMessages = [{ role: "tool", content: [{ type: "tool-result", id: "failed-read", name: "read", result: { type: "error", value: "permission denied" } }] }];
+  await sessionHooks.get("context")!({ sessionID: "errors", messages: toolMessages });
+  const nativeRequest = () => new Request("http://localhost/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ messages: [{ role: "tool", tool_call_id: "failed-read", content: "permission denied" }] }),
+  });
+  const failedRequest = { sessionID: "errors", kind: "primary", request: nativeRequest() };
+  await sessionHooks.get("http.request")!(failedRequest);
+  assertEqual((await failedRequest.request.json()).messages[0].is_error, true, "Expected typed V2 failures to survive HTTP serialization");
+  const otherRequest = { sessionID: "other", kind: "primary", request: nativeRequest() };
+  await sessionHooks.get("http.request")!(otherRequest);
+  assertEqual((await otherRequest.request.json()).messages[0].is_error, undefined, "Expected errors to remain session scoped");
+  const auxiliaryRequest = { sessionID: "errors", kind: "title", request: nativeRequest() };
+  await sessionHooks.get("http.request")!(auxiliaryRequest);
+  assertEqual((await auxiliaryRequest.request.json()).messages[0].is_error, undefined, "Expected primary failures not to leak into title requests");
+  await sessionHooks.get("context")!({ sessionID: "errors", messages: [] });
+  const clearedRequest = { sessionID: "errors", kind: "primary", request: nativeRequest() };
+  await sessionHooks.get("http.request")!(clearedRequest);
+  assertEqual((await clearedRequest.request.json()).messages[0].is_error, undefined, "Expected fresh snapshots to clear old error markers");
   assert(integrationTransform, "Expected V2 integration transform");
   if (initiallyConnected) {
     assert(providerSource, "Expected provider at signed-in startup");
@@ -1178,6 +1206,27 @@ async function testV2Plugin(
   );
   console.log("[test] V2 plugin OK");
 }
+
+async function testLegacyToolErrorHeaders(modules: TestModules) {
+  let requests = 0;
+  const hooks = await modules.CursorAuthPlugin({
+    client: { session: { async messages() {
+      requests++;
+      return { data: [{ parts: [
+        { type: "tool", callID: "failed", state: { status: "error", error: "permission denied" } },
+        { type: "tool", callID: "success", state: { status: "completed", output: "permission denied" } },
+      ] }] };
+    } } },
+  } as any);
+  const headers: Record<string, string> = {};
+  await hooks["chat.headers"]!({ sessionID: "s", model: { providerID: "cursor" } } as any, { headers });
+  assertEqual(headers[TOOL_ERRORS_HEADER], '["failed"]', "Expected only typed legacy failures in the header");
+  const unrelated: Record<string, string> = {};
+  await hooks["chat.headers"]!({ sessionID: "s", model: { providerID: "other" } } as any, { headers: unrelated });
+  assertEqual(requests, 1, "Expected non-Cursor requests not to query session history");
+  assertEqual(unrelated[TOOL_ERRORS_HEADER], undefined, "Expected no marker for other providers");
+}
+
 
 async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Testing array content (plan-mode) parsing...");
@@ -1593,6 +1642,7 @@ async function main() {
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
+    await testLegacyToolErrorHeaders(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

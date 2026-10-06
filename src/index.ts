@@ -18,6 +18,7 @@ import {
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
+import { TOOL_ERRORS_HEADER } from "./tool-errors";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -130,6 +131,16 @@ export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   return {
+    "chat.headers": async (hookInput, output) => {
+      if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) return;
+      // V1's serializer also drops typed failure status. The session API keeps
+      // it, so pass call IDs explicitly rather than guessing from error text.
+      const messages = await input.client.session.messages({ path: { id: hookInput.sessionID } });
+      const ids = (messages.data ?? []).flatMap((message) => message.parts.flatMap((part) =>
+        part.type === "tool" && part.state.status === "error" ? [part.callID] : [],
+      ));
+      output.headers[TOOL_ERRORS_HEADER] = JSON.stringify(ids);
+    },
     /**
      * opencode >= 1.18 builds its provider catalog from config + models.dev
      * before auth loaders run, and `auth.loader` only receives a deep copy of

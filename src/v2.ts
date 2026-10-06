@@ -11,6 +11,7 @@ import {
   type CursorModel,
 } from "./models";
 import { startProxy, stopProxy } from "./proxy";
+import { collectToolErrorIds, markToolErrors } from "./tool-errors";
 
 const CURSOR_ID = "cursor";
 const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
@@ -29,6 +30,25 @@ interface ProviderState {
 const CursorV2Plugin = Plugin.define({
   id: "opencode.cursor-oauth",
   setup: async (ctx) => {
+    // Primary turns are serialized per session. Keep separate snapshots for
+    // auxiliary request kinds and bound retention for long-lived plugin hosts.
+    const toolErrors = new Map<string, Set<string>>();
+    for (const [hook, kind] of [
+      ["context", "primary"], ["compaction", "compaction"],
+      ["generate", "generate"], ["title", "title"],
+    ] as const) {
+      await ctx.session.hook(hook, (event) => {
+        const key = `${event.sessionID}:${kind}`;
+        toolErrors.delete(key);
+        toolErrors.set(key, collectToolErrorIds(event.messages));
+        if (toolErrors.size > 256) toolErrors.delete(toolErrors.keys().next().value!);
+      }, { providerID: CURSOR_ID });
+    }
+    await ctx.session.hook("http.request", async (event) => {
+      const ids = toolErrors.get(`${event.sessionID}:${event.kind}`);
+      if (ids) event.request = await markToolErrors(event.request, ids);
+    }, { providerID: CURSOR_ID });
+
     await ctx.integration.transform((draft) => {
       draft.update(CURSOR_ID, (integration) => {
         integration.name = "Cursor";
@@ -119,6 +139,7 @@ const CursorV2Plugin = Plugin.define({
       try {
         await stopWatching();
       } finally {
+        toolErrors.clear();
         stopProxy();
       }
     };

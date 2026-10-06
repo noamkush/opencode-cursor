@@ -69,6 +69,12 @@ permission boundary. Cut-off reads keep their
 continuation guidance; when a file's full line count or size is unavailable,
 the proxy reports a lower bound or unknown.
 
+Typed tool failures are carried explicitly across OpenAI Chat serialization so
+Cursor receives errors rather than successful reads containing error text. V2
+uses Cursor-scoped request hooks; V1 passes failed call IDs from session history.
+Failures reach Cursor as their plain message, and a read of a missing file is
+reported as not found so Cursor's write tool can create new files.
+
 ## Use
 
 Start OpenCode and select any Cursor model. The plugin starts a local
