@@ -21,6 +21,7 @@ import { startProxy } from "./proxy";
 import { encodeMcpServerNames, MCP_SERVERS_HEADER } from "./mcp-servers";
 import { TOOL_ERRORS_HEADER } from "./tool-errors";
 import { encodeWorkspaceDirectory, WORKSPACE_DIRECTORY_HEADER } from "./workspace";
+import { encodeSessionKey, SESSION_HEADER, v1RequestKind } from "./session-key";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -156,6 +157,7 @@ export const CursorAuthPlugin: Plugin = async (
       output.headers[TOOL_ERRORS_HEADER] = JSON.stringify(ids);
       output.headers[MCP_SERVERS_HEADER] = encodeMcpServerNames(await connectedMcpServers(input));
       output.headers[WORKSPACE_DIRECTORY_HEADER] = encodeWorkspaceDirectory(input.directory);
+      output.headers[SESSION_HEADER] = encodeSessionKey(hookInput.sessionID, v1RequestKind(hookInput.agent));
     },
     /**
      * opencode >= 1.18 builds its provider catalog from config + models.dev

@@ -105,6 +105,7 @@ import {
   unwrapReadOutput,
   type NativeExecBinding,
 } from "./native-tools";
+import { decodeSessionKey, SESSION_HEADER } from "./session-key";
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -161,7 +162,7 @@ interface ContentPart {
   text?: string;
 }
 
-interface OpenAIMessage {
+export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null | ContentPart[];
   tool_call_id?: string;
@@ -607,7 +608,8 @@ export async function startProxy(
           const accessToken = await proxyAccessTokenProvider();
           const mcpServers = decodeMcpServerNames(req.headers.get(MCP_SERVERS_HEADER));
           const directory = decodeWorkspaceDirectory(req.headers.get(WORKSPACE_DIRECTORY_HEADER));
-          return handleChatCompletion(body, accessToken, mcpServers, directory);
+          const sessionKey = decodeSessionKey(req.headers.get(SESSION_HEADER));
+          return handleChatCompletion(body, accessToken, mcpServers, directory, sessionKey);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
@@ -650,6 +652,7 @@ async function handleChatCompletion(
   accessToken: string,
   mcpServers: readonly string[],
   directory?: string,
+  sessionKey?: string,
 ): Promise<Response> {
   const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
@@ -669,8 +672,8 @@ async function handleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionKey);
+  const convKey = deriveConversationKey(body.messages, sessionKey);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -1833,22 +1836,25 @@ export function abortPendingExec(
   return true;
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+/** Session scope plus the opening prompt; without a session only the prompt, as before. */
+function conversationSeed(messages: OpenAIMessage[], sessionKey: string | undefined): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+  const firstUserText = (firstUserMsg ? textContent(firstUserMsg.content) : "").slice(0, 200);
+  return sessionKey === undefined ? firstUserText : `session:${sessionKey}:${firstUserText}`;
+}
+
+/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
+export function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionKey?: string): string {
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${modelId}:${conversationSeed(messages, sessionKey)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
-function deriveConversationKey(messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+export function deriveConversationKey(messages: OpenAIMessage[], sessionKey?: string): string {
   return createHash("sha256")
-    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .update(`conv:${conversationSeed(messages, sessionKey)}`)
     .digest("hex")
     .slice(0, 16);
 }

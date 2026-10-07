@@ -13,6 +13,7 @@ import {
 import { startProxy, stopProxy } from "./proxy";
 import { withMcpServerNames } from "./mcp-servers";
 import { withWorkspaceDirectory } from "./workspace";
+import { withSessionKey } from "./session-key";
 import { collectToolErrorIds, markToolErrors } from "./tool-errors";
 
 const CURSOR_ID = "cursor";
@@ -49,6 +50,7 @@ const CursorV2Plugin = Plugin.define({
     await ctx.session.hook("http.request", async (event) => {
       const ids = toolErrors.get(`${event.sessionID}:${event.kind}`);
       if (ids) event.request = await markToolErrors(event.request, ids);
+      event.request = withSessionKey(event.request, event.sessionID, event.kind);
       const directory = await sessionDirectory(ctx, event.sessionID);
       event.request = withMcpServerNames(event.request, await connectedMcpServers(ctx, directory));
       if (directory) event.request = withWorkspaceDirectory(event.request, directory);

@@ -134,7 +134,9 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 Conversation history is rebuilt from the OpenAI messages on every request
 (`rootPromptMessagesJson` + content-addressed turn blobs), and server
 checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
-context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
+context survives restarts. State is keyed by the OpenCode session, the request
+kind (primary, title, compaction, generate) and the opening prompt, so sessions
+that start with the same prompt do not share a Cursor conversation. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
 handshake, bridge stderr, stream lifecycle, and exec correlation traffic when
 debugging. Diagnostics are appended as JSONL to
 `$XDG_DATA_HOME/opencode/log/cursor-proxy.jsonl` (or
