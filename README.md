@@ -75,6 +75,10 @@ uses Cursor-scoped request hooks; V1 passes failed call IDs from session history
 Failures reach Cursor as their plain message, and a read of a missing file is
 reported as not found so Cursor's write tool can create new files.
 
+Cursor is told the session directory as its workspace root, and native `ls` and
+`grep` results report absolute paths, so the model resolves relative paths
+against the same directory OpenCode does.
+
 Native shell calls can redirect to either `bash` or `shell`, using only arguments
 advertised by that tool. Unavailable streaming-shell calls receive a streaming
 rejection before closing, rather than an unrecognized non-streaming response.

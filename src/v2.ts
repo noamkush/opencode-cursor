@@ -12,6 +12,7 @@ import {
 } from "./models";
 import { startProxy, stopProxy } from "./proxy";
 import { withMcpServerNames } from "./mcp-servers";
+import { withWorkspaceDirectory } from "./workspace";
 import { collectToolErrorIds, markToolErrors } from "./tool-errors";
 
 const CURSOR_ID = "cursor";
@@ -48,7 +49,9 @@ const CursorV2Plugin = Plugin.define({
     await ctx.session.hook("http.request", async (event) => {
       const ids = toolErrors.get(`${event.sessionID}:${event.kind}`);
       if (ids) event.request = await markToolErrors(event.request, ids);
-      event.request = withMcpServerNames(event.request, await connectedMcpServers(ctx, event.sessionID));
+      const directory = await sessionDirectory(ctx, event.sessionID);
+      event.request = withMcpServerNames(event.request, await connectedMcpServers(ctx, directory));
+      if (directory) event.request = withWorkspaceDirectory(event.request, directory);
     }, { providerID: CURSOR_ID });
 
     await ctx.integration.transform((draft) => {
@@ -165,11 +168,19 @@ async function loadInventory(
   }
 }
 
-/** MCP servers connected in the session's directory; empty when unknown. */
-async function connectedMcpServers(ctx: Plugin.Context, sessionID: string): Promise<string[]> {
+async function sessionDirectory(ctx: Plugin.Context, sessionID: string): Promise<string | undefined> {
   try {
-    const session = await ctx.session.get({ sessionID });
-    const servers = await ctx.mcp.list({ location: { directory: session.location.directory } });
+    return (await ctx.session.get({ sessionID })).location.directory;
+  } catch {
+    return undefined;
+  }
+}
+
+/** MCP servers connected in the session's directory; empty when unknown. */
+async function connectedMcpServers(ctx: Plugin.Context, directory: string | undefined): Promise<string[]> {
+  if (!directory) return [];
+  try {
+    const servers = await ctx.mcp.list({ location: { directory } });
     return servers.data.flatMap((server) => server.status.status === "connected" ? [server.name] : []);
   } catch {
     return [];

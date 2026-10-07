@@ -44,6 +44,12 @@ export const REQUEST_CONTEXT_MCP_META_TOOL_OPTIONS_FIELD = 34;
 /** `RequestContext.mcp_info_complete`, a varint bool. */
 export const REQUEST_CONTEXT_MCP_INFO_COMPLETE_FIELD = 36;
 
+/**
+ * `RequestContextEnv.process_working_directory`, an optional string. Cursor's
+ * own client sends the directory relative paths resolve against.
+ */
+export const REQUEST_CONTEXT_ENV_PROCESS_WORKING_DIRECTORY_FIELD = 21;
+
 /** `McpArgs.server_identifier`, a string naming the tool's MCP server. */
 export const MCP_ARGS_SERVER_IDENTIFIER_FIELD = 9;
 
@@ -106,6 +112,11 @@ function readLastVarint(
 /** Encode a varint bool unknown field. */
 export function unknownBoolField(no: number, value: boolean): UnknownField {
   return { no, wireType: WireType.Varint, data: new BinaryWriter().bool(value).finish() };
+}
+
+/** Encode a length-delimited string unknown field. */
+export function unknownStringField(no: number, value: string): UnknownField {
+  return { no, wireType: WireType.LengthDelimited, data: new BinaryWriter().string(value).finish() };
 }
 
 /**

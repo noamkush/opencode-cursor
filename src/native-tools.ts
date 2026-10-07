@@ -58,6 +58,7 @@ import {
   readUnknownUint32,
   unknownBoolField,
 } from "./unknown-fields";
+import { resolveWorkspacePath } from "./workspace";
 
 export type NativeResultType =
   | "readResult"
@@ -71,7 +72,10 @@ export type NativeResultType =
 /** How to answer the paused native exec once the redirected tool result arrives. */
 export interface NativeExecBinding {
   resultType: NativeResultType;
-  /** Native arg values needed to shape the typed result frame. */
+  /**
+   * Native arg values needed to shape the typed result frame. `root` is the
+   * absolute search directory, when known.
+   */
   args: Record<string, string>;
 }
 
@@ -317,6 +321,7 @@ export function bindReadOutput(binding: NativeExecBinding, output: string): Nati
 export function redirectNativeExec(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
+  directory?: string,
 ): NativeRedirect | null {
   const execCase = execMsg.message.case;
   const available = new Set(
@@ -324,6 +329,10 @@ export function redirectNativeExec(
   );
   const pick = (candidates: string[]) =>
     candidates.find((name) => available.has(name));
+  const root = (path: string) => {
+    const resolved = resolveWorkspacePath(path || ".", directory);
+    return resolved ? { root: resolved } : undefined;
+  };
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -431,7 +440,7 @@ export function redirectNativeExec(
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
       decodedArgs: JSON.stringify({ pattern: "*", path: args.path ?? "" }),
-      binding: { resultType: "lsResult", args: { path: args.path ?? "" } },
+      binding: { resultType: "lsResult", args: { path: args.path ?? "", ...root(args.path ?? "") } },
     };
   }
 
@@ -452,6 +461,7 @@ export function redirectNativeExec(
           args: {
             pattern: args.glob,
             path: args.path ?? "",
+            ...root(args.path ?? ""),
             outputMode: "files_with_matches",
           },
         },
@@ -471,6 +481,7 @@ export function redirectNativeExec(
         args: {
           pattern: args.pattern || ".",
           path: args.path ?? "",
+          ...root(args.path ?? ""),
           outputMode: args.outputMode || "content",
           ...(args.multiline ? { multiline: "true" } : undefined),
         },
@@ -655,7 +666,7 @@ export function sendNativeExecResult(
         }));
         return true;
       }
-      const built = buildLsResult(text, args.path ?? "");
+      const built = buildLsResult(text, args.root ?? args.path ?? "");
       if (!built) return false;
       sendExec("lsResult", built);
       return true;
@@ -852,7 +863,7 @@ export function buildGrepResult(content: string, args: Record<string, string>) {
         path,
         outputMode,
         workspaceResults: {
-          [path || "."]: create(GrepUnionResultSchema, { result: unionResult }),
+          [args.root || path || "."]: create(GrepUnionResultSchema, { result: unionResult }),
         },
       }),
     },
