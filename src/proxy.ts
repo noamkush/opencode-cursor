@@ -84,6 +84,7 @@ import {
 } from "./proto/agent_pb";
 import { buildInteractionResponse } from "./interaction-query";
 import { decodeMcpServerNames, MCP_SERVERS_HEADER } from "./mcp-servers";
+import { buildRequestContextEnv, decodeWorkspaceDirectory, WORKSPACE_DIRECTORY_HEADER } from "./workspace";
 import { decodeToolErrorIds, markToolErrors, TOOL_ERRORS_HEADER, toolErrorText } from "./tool-errors";
 import {
   EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD,
@@ -190,12 +191,20 @@ interface ChatCompletionRequest {
 }
 
 
+/** Per-request values Cursor asks for through RequestContext. */
+export interface CursorContext {
+  /** System prompt forwarded via RequestContext.cloudRule (issue #21). */
+  cloudRule?: string;
+  /** Absolute session directory that relative tool paths resolve against. */
+  directory?: string;
+}
+
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
-  /** System prompt forwarded via RequestContext.cloudRule (issue #21). */
-  cloudRule?: string;
+  /** Workspace and system prompt for Cursor's RequestContext. */
+  context: CursorContext;
 }
 
 /** A pending tool execution waiting for results from the caller. */
@@ -217,7 +226,7 @@ interface ActiveBridge {
   frameParser: ReturnType<typeof createConnectFrameParser>;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
-  cloudRule?: string;
+  context: CursorContext;
   pendingExecs: PendingExec[];
   queuedExecs: PendingExec[];
   /** Latest Cursor conversation occupancy (`used_tokens`). */
@@ -597,7 +606,8 @@ export async function startProxy(
           }
           const accessToken = await proxyAccessTokenProvider();
           const mcpServers = decodeMcpServerNames(req.headers.get(MCP_SERVERS_HEADER));
-          return handleChatCompletion(body, accessToken, mcpServers);
+          const directory = decodeWorkspaceDirectory(req.headers.get(WORKSPACE_DIRECTORY_HEADER));
+          return handleChatCompletion(body, accessToken, mcpServers, directory);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
@@ -639,6 +649,7 @@ async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   mcpServers: readonly string[],
+  directory?: string,
 ): Promise<Response> {
   const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
@@ -706,6 +717,7 @@ async function handleChatCompletion(
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
+  payload.context.directory = directory;
 
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
@@ -1012,7 +1024,7 @@ function buildCursorRequest(
     requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
     blobStore,
     mcpTools: [],
-    cloudRule: prompts.join("\n\n").trim() || undefined,
+    context: { cloudRule: prompts.join("\n\n").trim() || undefined },
   };
 }
 
@@ -1202,7 +1214,7 @@ function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
-  cloudRule: string | undefined,
+  context: CursorContext | undefined,
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
@@ -1221,7 +1233,7 @@ function processServerMessage(
     handleExecMessage(
       msg.message.value as ExecServerMessage,
       mcpTools,
-      cloudRule,
+      context,
       sendFrame,
       onMcpExec,
       onUnhandledExec,
@@ -1326,7 +1338,7 @@ function handleKvMessage(
 export function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
-  cloudRule: string | undefined,
+  context: CursorContext | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
   onUnhandledExec?: (execCase: string) => void,
@@ -1341,7 +1353,8 @@ export function handleExecMessage(
     // system messages are ignored server-side (issue #21).
     const requestContext = create(RequestContextSchema, {
       rules: [],
-      cloudRule,
+      cloudRule: context?.cloudRule,
+      env: buildRequestContextEnv(context?.directory),
       repositoryInfo: [],
       tools: mcpTools,
       gitRepos: [],
@@ -1387,7 +1400,7 @@ export function handleExecMessage(
   // The model tries these before the MCP tools. When the client provides an
   // equivalent tool, redirect the call to it; otherwise reject so the model
   // falls back to the MCP tools registered via RequestContext.
-  const redirect = redirectNativeExec(execMsg, mcpTools);
+  const redirect = redirectNativeExec(execMsg, mcpTools, context?.directory);
   if (redirect) {
     if (process.env.CURSOR_PROXY_DEBUG) {
       console.error(`[proxy] redirect ${execCase} -> ${redirect.toolName}`);
@@ -1861,7 +1874,7 @@ function createBridgeStreamResponse(
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
-  cloudRule: string | undefined,
+  context: CursorContext,
   modelId: string,
   bridgeKey: string,
   convKey: string,
@@ -2027,7 +2040,7 @@ function createBridgeStreamResponse(
           frameParser,
           blobStore,
           mcpTools,
-          cloudRule,
+          context,
           pendingExecs: state.pendingExecs,
           queuedExecs,
           totalTokens: state.totalTokens,
@@ -2082,7 +2095,7 @@ function createBridgeStreamResponse(
               serverMessage,
               blobStore,
               mcpTools,
-              cloudRule,
+              context,
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
@@ -2212,7 +2225,7 @@ function handleStreamingResponse(
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    payload.blobStore, payload.mcpTools, payload.cloudRule,
+    payload.blobStore, payload.mcpTools, payload.context,
     modelId, bridgeKey, convKey,
     createConnectFrameParser(),
     [],
@@ -2235,7 +2248,7 @@ function handleToolResultResume(
     frameParser,
     blobStore,
     mcpTools,
-    cloudRule,
+    context,
     pendingExecs,
     queuedExecs,
   } = active;
@@ -2252,7 +2265,7 @@ function handleToolResultResume(
   // installs handlers before any continuation frame can arrive.
   const response = createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    blobStore, mcpTools, cloudRule,
+    blobStore, mcpTools, context,
     modelId, bridgeKey, convKey, frameParser, initialExecs,
     active.totalTokens,
   );
@@ -2439,7 +2452,7 @@ async function collectFullResponse(
           serverMessage,
           payload.blobStore,
           payload.mcpTools,
-          payload.cloudRule,
+          payload.context,
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
