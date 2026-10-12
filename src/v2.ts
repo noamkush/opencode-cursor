@@ -101,7 +101,8 @@ const CursorV2Plugin = Plugin.define({
     // Apply OAuth refresh before loading the provider inventory.
     await ctx.integration.reload();
 
-    let inventory = await loadInventory(ctx);
+    const proxyHolder = {};
+    let inventory = await loadInventory(ctx, proxyHolder);
     await ctx.provider.transform((editor) => {
       const current = inventory;
       if (!current) return;
@@ -137,8 +138,8 @@ const CursorV2Plugin = Plugin.define({
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
-      inventory = await loadInventory(ctx);
-      if (!inventory) stopProxy();
+      inventory = await loadInventory(ctx, proxyHolder);
+      if (!inventory) stopProxy(proxyHolder);
       await ctx.provider.reload();
     });
 
@@ -147,7 +148,7 @@ const CursorV2Plugin = Plugin.define({
         await stopWatching();
       } finally {
         toolErrors.clear();
-        stopProxy();
+        stopProxy(proxyHolder);
       }
     };
   },
@@ -157,13 +158,14 @@ export default CursorV2Plugin;
 
 async function loadInventory(
   ctx: Plugin.Context,
+  proxyHolder: object,
 ): Promise<ProviderState | undefined> {
   try {
     const connection = await ctx.integration.connection.active(CURSOR_ID);
     if (!connection) return undefined;
     const accessToken = await resolveAccessToken(ctx, connection);
     const models = await getCursorModels(accessToken);
-    const port = await startProxy(() => getAccessToken(ctx), models);
+    const port = await startProxy(() => getAccessToken(ctx), models, proxyHolder);
     return { models, port, connection };
   } catch {
     return undefined;

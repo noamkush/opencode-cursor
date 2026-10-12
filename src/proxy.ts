@@ -562,6 +562,15 @@ let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 
+interface ProxyRegistration {
+  getAccessToken: () => Promise<string>;
+  models: Array<{ id: string; name: string }>;
+}
+
+// The module is shared by every plugin instance in the process (one per
+// OpenCode location), so the server stays up until the last holder releases it.
+const proxyHolders = new Map<object, ProxyRegistration>();
+
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
   object: "model";
@@ -583,12 +592,17 @@ export function getProxyPort(): number | undefined {
 export async function startProxy(
   getAccessToken: () => Promise<string>,
   models: ReadonlyArray<{ id: string; name: string }> = [],
+  holder?: object,
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   proxyModels = models.map((model) => ({
     id: model.id,
     name: model.name,
   }));
+  if (holder) {
+    proxyHolders.delete(holder);
+    proxyHolders.set(holder, { getAccessToken, models: proxyModels });
+  }
   if (proxyServer && proxyPort) return proxyPort;
 
   pruneStaleConversationFiles();
@@ -641,7 +655,25 @@ export async function startProxy(
   return proxyPort;
 }
 
-export function stopProxy(): void {
+/**
+ * Release `holder`'s use of the proxy, stopping it once no holders remain.
+ * Without a holder the proxy stops unconditionally.
+ */
+export function stopProxy(holder?: object): void {
+  if (holder) {
+    const released = proxyHolders.get(holder);
+    if (!released) return;
+    proxyHolders.delete(holder);
+    const latest = [...proxyHolders.values()].at(-1);
+    if (latest) {
+      if (proxyAccessTokenProvider === released.getAccessToken) {
+        proxyAccessTokenProvider = latest.getAccessToken;
+        proxyModels = latest.models;
+      }
+      return;
+    }
+  }
+  proxyHolders.clear();
   if (proxyServer) {
     proxyServer.stop();
     proxyServer = undefined;

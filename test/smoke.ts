@@ -599,6 +599,35 @@ async function testProxyStartStop(modules: TestModules) {
   console.log("[test] Proxy stop OK");
 }
 
+async function testProxySharedByHolders(modules: TestModules) {
+  console.log("[test] Testing proxy shared by plugin instances...");
+  const first = {};
+  const second = {};
+  const port = await modules.startProxy(async () => "first-token", [{ id: "a", name: "A" }], first);
+  assertEqual(
+    await modules.startProxy(async () => "second-token", [{ id: "b", name: "B" }], second),
+    port,
+    "Expected plugin instances to share one proxy",
+  );
+
+  modules.stopProxy(second);
+  assertEqual(modules.getProxyPort(), port, "Expected the proxy to outlive a released holder");
+  const res = await fetch(`http://localhost:${port}/v1/models`);
+  assert(res.ok, "Expected the proxy to keep serving after one holder released it");
+  assertArrayEqual(
+    (await res.json()).data.map((model: { id: string }) => model.id),
+    ["a"],
+    "Expected the remaining holder's models after release",
+  );
+
+  modules.stopProxy(second);
+  assertEqual(modules.getProxyPort(), port, "Expected a repeated release to be ignored");
+
+  modules.stopProxy(first);
+  assertEqual(modules.getProxyPort(), undefined, "Expected the last release to stop the proxy");
+  console.log("[test] Shared proxy lifetime OK");
+}
+
 async function testStreamCancellationStopsBridge(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1653,6 +1682,7 @@ async function main() {
   try {
     testUnwrapReadOutput();
     await testProxyStartStop(modules);
+    await testProxySharedByHolders(modules);
     await testStreamCancellationStopsBridge(modules, backend);
     testHeartbeatClassification(modules);
     testConnectFrameParserHandoff(modules);
