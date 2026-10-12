@@ -146,7 +146,6 @@ const SSE_HEADERS = {
 function debugLog(event: string, details: Record<string, unknown> = {}): void {
   if (!DEBUG) return;
   const line = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
-  console.error(`[cursor-proxy] ${event}`, details);
   void mkdir(pathResolve(DEBUG_LOG_PATH, ".."), { recursive: true })
     .then(() => appendFile(DEBUG_LOG_PATH, `${line}\n`))
     .catch(() => {});
@@ -1388,9 +1387,7 @@ export function handleExecMessage(
   onUnhandledExec?: (execCase: string) => void,
 ): void {
   const execCase = execMsg.message.case;
-  if (process.env.CURSOR_PROXY_DEBUG) {
-    console.error(`[proxy] exec: ${execCase}`);
-  }
+  debugLog("exec.received", { execCase });
 
   if (execCase === "requestContextArgs") {
     const result = create(RequestContextResultSchema, {
@@ -1431,9 +1428,7 @@ export function handleExecMessage(
   // falls back to the MCP tools registered via RequestContext.
   const redirect = redirectNativeExec(execMsg, mcpTools, context?.directory);
   if (redirect) {
-    if (process.env.CURSOR_PROXY_DEBUG) {
-      console.error(`[proxy] redirect ${execCase} -> ${redirect.toolName}`);
-    }
+    debugLog("exec.redirected", { execCase, toolName: redirect.toolName });
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
@@ -2175,9 +2170,7 @@ function createBridgeStreamResponse(
         (endStreamBytes) => {
           noteMeaningfulActivity("server.end_stream");
           const endError = parseConnectEndStream(endStreamBytes);
-          if (DEBUG) {
-            console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
-          }
+          debugLog("stream.end", { bridgeKey, error: endError?.message });
           if (endError) {
             // Surface the error and shut down: the server is done with this
             // stream, and heartbeats would otherwise keep the bridge (and the

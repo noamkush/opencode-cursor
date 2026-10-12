@@ -136,11 +136,27 @@ Conversation history is rebuilt from the OpenAI messages on every request
 checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
 context survives restarts. State is keyed by the OpenCode session, the request
 kind (primary, title, compaction, generate) and the opening prompt, so sessions
-that start with the same prompt do not share a Cursor conversation. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
-handshake, bridge stderr, stream lifecycle, and exec correlation traffic when
-debugging. Diagnostics are appended as JSONL to
+that start with the same prompt do not share a Cursor conversation.
+
+### Debugging
+
+Set `CURSOR_PROXY_DEBUG=1` to log the KV blob handshake, bridge stderr, stream
+lifecycle, and exec correlation traffic. Diagnostics are appended as JSONL to
 `$XDG_DATA_HOME/opencode/log/cursor-proxy.jsonl` (or
 `~/.local/share/opencode/log/cursor-proxy.jsonl`), alongside OpenCode's data.
+
+OpenCode V2 runs the plugin in a background service that does not inherit the
+environment of later `opencode` invocations, so set the variable on the service
+instead:
+
+```sh
+opencode service set env CURSOR_PROXY_DEBUG 1
+```
+
+This stops the service; the next `opencode` starts it with the variable set.
+Remove it with `opencode service unset env CURSOR_PROXY_DEBUG`. For a one-off
+session, `CURSOR_PROXY_DEBUG=1 opencode --standalone` runs a private server that
+inherits your shell environment.
 
 ## Develop locally
 
