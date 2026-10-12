@@ -87,6 +87,7 @@ import { decodeMcpServerNames, MCP_SERVERS_HEADER } from "./mcp-servers";
 import { buildRequestContextEnv, decodeWorkspaceDirectory, WORKSPACE_DIRECTORY_HEADER } from "./workspace";
 import { decodeToolErrorIds, markToolErrors, TOOL_ERRORS_HEADER, toolErrorText } from "./tool-errors";
 import {
+  AGENT_RUN_REQUEST_RUN_ID_FIELD,
   EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD,
   EXEC_MCP_STATE_FIELD,
   findUnknownField,
@@ -96,7 +97,15 @@ import {
   unknownBoolField,
   unknownMessageBytes,
   unknownMessageField,
+  unknownStringField,
 } from "./unknown-fields";
+import {
+  awaitInjectionState,
+  buildInjectContextMessage,
+  injectionAccepted,
+  readInjectionStateUpdate,
+  settleInjectionState,
+} from "./steering";
 import {
   bindReadOutput,
   normalizeToolArgs,
@@ -206,6 +215,8 @@ interface CursorRequestPayload {
   mcpTools: McpToolDefinition[];
   /** Workspace and system prompt for Cursor's RequestContext. */
   context: CursorContext;
+  /** `AgentRunRequest.run_id`, which steering injections must name. */
+  runId: string;
 }
 
 /** A pending tool execution waiting for results from the caller. */
@@ -232,6 +243,7 @@ interface ActiveBridge {
   queuedExecs: PendingExec[];
   /** Latest Cursor conversation occupancy (`used_tokens`). */
   totalTokens: number;
+  runId: string;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -1018,6 +1030,8 @@ function buildCursorRequest(
     requestedModel,
     conversationId,
   });
+  const runId = crypto.randomUUID();
+  runRequest.$unknown = [unknownStringField(AGENT_RUN_REQUEST_RUN_ID_FIELD, runId)];
 
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "runRequest", value: runRequest },
@@ -1028,6 +1042,7 @@ function buildCursorRequest(
     blobStore,
     mcpTools: [],
     context: { cloudRule: prompts.join("\n\n").trim() || undefined },
+    runId,
   };
 }
 
@@ -1279,6 +1294,13 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === undefined) {
+    // context_injection_state is newer than the checked-in schema.
+    const injection = readInjectionStateUpdate(update.$unknown);
+    if (injection) {
+      debugLog("steer.state_update", { ...injection });
+      settleInjectionState(injection);
+    }
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
@@ -1338,6 +1360,25 @@ function handleKvMessage(
   }
 }
 
+function buildRequestContext(context: CursorContext | undefined, mcpTools: McpToolDefinition[]) {
+  // cloudRule is the prompt channel Cursor's agent actually honors; plain
+  // system messages are ignored server-side (issue #21).
+  const requestContext = create(RequestContextSchema, {
+    rules: [],
+    cloudRule: context?.cloudRule,
+    env: buildRequestContextEnv(context?.directory),
+    repositoryInfo: [],
+    tools: mcpTools,
+    gitRepos: [],
+    projectLayouts: [],
+    mcpInstructions: [],
+    fileContents: {},
+    customSubagents: [],
+  });
+  requestContext.$unknown = buildMcpRequestContextFields(mcpTools);
+  return requestContext;
+}
+
 export function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
@@ -1352,25 +1393,10 @@ export function handleExecMessage(
   }
 
   if (execCase === "requestContextArgs") {
-    // cloudRule is the prompt channel Cursor's agent actually honors; plain
-    // system messages are ignored server-side (issue #21).
-    const requestContext = create(RequestContextSchema, {
-      rules: [],
-      cloudRule: context?.cloudRule,
-      env: buildRequestContextEnv(context?.directory),
-      repositoryInfo: [],
-      tools: mcpTools,
-      gitRepos: [],
-      projectLayouts: [],
-      mcpInstructions: [],
-      fileContents: {},
-      customSubagents: [],
-    });
-    requestContext.$unknown = buildMcpRequestContextFields(mcpTools);
     const result = create(RequestContextResultSchema, {
       result: {
         case: "success",
-        value: create(RequestContextSuccessSchema, { requestContext }),
+        value: create(RequestContextSuccessSchema, { requestContext: buildRequestContext(context, mcpTools) }),
       },
     });
     sendExecResult(execMsg, "requestContextResult", result, sendFrame);
@@ -1881,6 +1907,7 @@ function createBridgeStreamResponse(
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
   context: CursorContext,
+  runId: string,
   modelId: string,
   bridgeKey: string,
   convKey: string,
@@ -2050,6 +2077,7 @@ function createBridgeStreamResponse(
           pendingExecs: state.pendingExecs,
           queuedExecs,
           totalTokens: state.totalTokens,
+          runId,
         });
 
         if (toolBatchTimer) clearTimeout(toolBatchTimer);
@@ -2231,12 +2259,42 @@ function handleStreamingResponse(
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    payload.blobStore, payload.mcpTools, payload.context,
+    payload.blobStore, payload.mcpTools, payload.context, payload.runId,
     modelId, bridgeKey, convKey,
     createConnectFrameParser(),
     [],
     occupancyFromCheckpoint(conversationStates.get(convKey)?.checkpoint),
   );
+}
+
+/** How long to wait for Cursor to accept a steering message before falling back. */
+const STEER_STATE_TIMEOUT_MS = 3_000;
+
+/**
+ * Inject `userText` into a paused run as a user message. Resolves true once
+ * Cursor confirms the model will see it this turn.
+ */
+async function steerUserMessage(
+  bridge: ReturnType<typeof spawnBridge>,
+  runId: string,
+  userText: string,
+  context: CursorContext,
+  mcpTools: McpToolDefinition[],
+  bridgeKey: string,
+): Promise<boolean> {
+  if (!runId || !bridge.alive) return false;
+  const injectionId = crypto.randomUUID();
+  const verdict = awaitInjectionState(injectionId, STEER_STATE_TIMEOUT_MS);
+  const message = buildInjectContextMessage({
+    injectionId,
+    runId,
+    userMessage: toBinary(UserMessageSchema, create(UserMessageSchema, { text: userText, messageId: injectionId })),
+    requestContext: toBinary(RequestContextSchema, buildRequestContext(context, mcpTools)),
+  });
+  bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, message)));
+  const update = await verdict;
+  debugLog("steer.result", { bridgeKey, injectionId, state: update?.state ?? "timeout", reason: update?.reason });
+  return update !== undefined && injectionAccepted(update.state);
 }
 
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
@@ -2257,6 +2315,7 @@ function handleToolResultResume(
     context,
     pendingExecs,
     queuedExecs,
+    runId,
   } = active;
   const matchedExecs = pendingExecs.filter((exec) =>
     toolResults.some((result) => result.toolCallId === exec.toolCallId)
@@ -2271,7 +2330,7 @@ function handleToolResultResume(
   // installs handlers before any continuation frame can arrive.
   const response = createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    blobStore, mcpTools, context,
+    blobStore, mcpTools, context, runId,
     modelId, bridgeKey, convKey, frameParser, initialExecs,
     active.totalTokens,
   );
@@ -2279,109 +2338,120 @@ function handleToolResultResume(
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
   const lastExecId = matchedExecs[matchedExecs.length - 1]?.execId;
-  for (const exec of matchedExecs) {
-    const result = toolResults.find(
-      (r) => r.toolCallId === exec.toolCallId,
-    )!;
-    // A user message sent alongside tool results (e.g. the explanation typed
-    // after rejecting an edit) would otherwise be dropped: the paused bridge
-    // only accepts tool results. Attach it to the last result so the model
-    // sees it (issue #23).
-    let text = result.isError ? toolErrorText(result.content) : result.content;
-    let native = exec.native;
-    if (exec.toolName === "read") {
-      if (native && !result.isError) native = bindReadOutput(native, text);
-      if (!result.isError) text = unwrapReadOutput(text, { keepFooter: !native || native.args.truncated === "true" });
-    }
-    if (DEBUG) {
-      debugLog("exec.result_received", {
-        bridgeKey,
-        execId: exec.execId,
-        toolCallId: exec.toolCallId,
-        matched: true,
-      });
-    }
-    if (userText && exec.execId === lastExecId) {
-      text += `\n\n<user_message>\n${userText}\n</user_message>`;
-    }
+  const writeResults = (fallbackUserText: string | undefined) => {
+    for (const exec of matchedExecs) {
+      const result = toolResults.find(
+        (r) => r.toolCallId === exec.toolCallId,
+      )!;
+      let text = result.isError ? toolErrorText(result.content) : result.content;
+      let native = exec.native;
+      if (exec.toolName === "read") {
+        if (native && !result.isError) native = bindReadOutput(native, text);
+        if (!result.isError) text = unwrapReadOutput(text, { keepFooter: !native || native.args.truncated === "true" });
+      }
+      if (DEBUG) {
+        debugLog("exec.result_received", {
+          bridgeKey,
+          execId: exec.execId,
+          toolCallId: exec.toolCallId,
+          matched: true,
+        });
+      }
+      // Only when steering failed: inside a tool result the model tends to
+      // dismiss the text as injected, but that beats dropping it (issue #23).
+      if (fallbackUserText && exec.execId === lastExecId) {
+        text += `\n\n<user_message>\n${fallbackUserText}\n</user_message>`;
+      }
 
-    if (native) {
-      const sent = sendNativeExecResult(exec, native, text, result.isError, (bytes) => {
-        const frame = frameConnectMessage(bytes);
-        if (DEBUG) {
-          debugLog("exec.result_frame", {
-            bridgeKey,
-            execId: exec.execId,
-            toolName: exec.toolName,
-            type: "native",
-            resultType: native.resultType,
-            nativeArgs: native.args,
-            ...contentDiagnostics(text),
-            nativeResultBytes: bytes.length,
-            connectFrameBytes: frame.length,
-          });
+      if (native) {
+        const sent = sendNativeExecResult(exec, native, text, result.isError, (bytes) => {
+          const frame = frameConnectMessage(bytes);
+          if (DEBUG) {
+            debugLog("exec.result_frame", {
+              bridgeKey,
+              execId: exec.execId,
+              toolName: exec.toolName,
+              type: "native",
+              resultType: native.resultType,
+              nativeArgs: native.args,
+              ...contentDiagnostics(text),
+              nativeResultBytes: bytes.length,
+              connectFrameBytes: frame.length,
+            });
+          }
+          bridge.write(frame);
+        });
+        if (sent) {
+          sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
+          if (DEBUG) {
+            debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "native" });
+          }
+          continue;
         }
-        bridge.write(frame);
+      }
+
+      const mcpResult = create(McpResultSchema, {
+        result: {
+          case: "success",
+          value: create(McpSuccessSchema, {
+            content: [
+              create(McpToolResultContentItemSchema, {
+                content: {
+                  case: "text",
+                  value: create(McpTextContentSchema, { text }),
+                },
+              }),
+            ],
+            isError: result.isError,
+          }),
+        },
       });
-      if (sent) {
-        sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
-        if (DEBUG) {
-          debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "native" });
-        }
-        continue;
+
+      const execClientMessage = create(ExecClientMessageSchema, {
+        id: exec.execMsgId,
+        execId: exec.execId,
+        message: {
+          case: "mcpResult" as never,
+          value: mcpResult as never,
+        },
+      });
+
+      const clientMessage = create(AgentClientMessageSchema, {
+        message: { case: "execClientMessage", value: execClientMessage },
+      });
+      const clientMessageBytes = toBinary(AgentClientMessageSchema, clientMessage);
+      const frame = frameConnectMessage(clientMessageBytes);
+      if (DEBUG) {
+        debugLog("exec.result_frame", {
+          bridgeKey,
+          execId: exec.execId,
+          toolName: exec.toolName,
+          matched: true,
+          ...contentDiagnostics(text),
+          mcpResultBytes: toBinary(McpResultSchema, mcpResult).length,
+          clientMessageBytes: clientMessageBytes.length,
+          connectFrameBytes: frame.length,
+        });
+      }
+      bridge.write(frame);
+      sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
+      if (DEBUG) {
+        debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "mcp" });
       }
     }
+  };
 
-    const mcpResult = create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: [
-            create(McpToolResultContentItemSchema, {
-              content: {
-                case: "text",
-                value: create(McpTextContentSchema, { text }),
-              },
-            }),
-          ],
-          isError: result.isError,
-        }),
-      },
-    });
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: {
-        case: "mcpResult" as never,
-        value: mcpResult as never,
-      },
-    });
-
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    const clientMessageBytes = toBinary(AgentClientMessageSchema, clientMessage);
-    const frame = frameConnectMessage(clientMessageBytes);
-    if (DEBUG) {
-      debugLog("exec.result_frame", {
-        bridgeKey,
-        execId: exec.execId,
-        toolName: exec.toolName,
-        matched: true,
-        ...contentDiagnostics(text),
-        mcpResultBytes: toBinary(McpResultSchema, mcpResult).length,
-        clientMessageBytes: clientMessageBytes.length,
-        connectFrameBytes: frame.length,
-      });
-    }
-    bridge.write(frame);
-    sendExecStreamClose(exec.execMsgId, (data) => bridge.write(data));
-    if (DEBUG) {
-      debugLog("exec.result_written", { bridgeKey, execId: exec.execId, type: "mcp" });
-    }
+  // A user message sent alongside tool results (e.g. the explanation typed
+  // after rejecting an edit) is steered into the run as a real user message,
+  // the way Cursor's own client does. Results wait for Cursor's verdict so the
+  // message is queued before the step it should reach.
+  if (!userText || matchedExecs.length === 0) {
+    writeResults(undefined);
+    return response;
   }
-
+  void steerUserMessage(bridge, runId, userText, context, mcpTools, bridgeKey)
+    .catch(() => false)
+    .then((steered) => writeResults(steered ? undefined : userText));
   return response;
 }
 

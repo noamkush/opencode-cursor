@@ -69,6 +69,25 @@ export const READ_ARGS_LIMIT_FIELD = 5;
  */
 export const READ_SUCCESS_RANGE_APPLIED_FIELD = 8;
 
+/**
+ * `AgentRunRequest.run_id`, an optional string. Identifies the run so a
+ * later `InjectContextAction.expected_run_id` can target it.
+ */
+export const AGENT_RUN_REQUEST_RUN_ID_FIELD = 25;
+
+/**
+ * `ConversationAction.inject_context_action`, a length-delimited
+ * `InjectContextAction`. Cursor's own client uses it to steer a run that is
+ * already working with a user message.
+ */
+export const CONVERSATION_ACTION_INJECT_CONTEXT_FIELD = 19;
+
+/**
+ * `InteractionUpdate.context_injection_state`, a length-delimited
+ * `ContextInjectionStateUpdate` reporting what happened to an injection.
+ */
+export const INTERACTION_UPDATE_CONTEXT_INJECTION_STATE_FIELD = 23;
+
 /** Find an unknown field by number and wire type. */
 export function findUnknownField(
   fields: readonly UnknownField[] | undefined,
