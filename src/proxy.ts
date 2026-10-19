@@ -89,8 +89,11 @@ import { decodeToolErrorIds, markToolErrors, TOOL_ERRORS_HEADER, toolErrorText }
 import {
   AGENT_RUN_REQUEST_RUN_ID_FIELD,
   EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD,
+  EXEC_FORCE_BACKGROUND_SHELL_FIELD,
+  EXEC_FORCE_BACKGROUND_SUBAGENT_FIELD,
   EXEC_MCP_STATE_FIELD,
   findUnknownField,
+  FORCE_BACKGROUND_STATUS_NOT_FOUND,
   MCP_ARGS_SERVER_IDENTIFIER_FIELD,
   REQUEST_CONTEXT_MCP_INFO_COMPLETE_FIELD,
   REQUEST_CONTEXT_MCP_META_TOOL_OPTIONS_FIELD,
@@ -1454,6 +1457,20 @@ export function handleExecMessage(
     return;
   }
 
+  // force_background_{shell,subagent}_args arrive in $unknown; see src/unknown-fields.ts.
+  const forceBackground = forceBackgroundExecField(execMsg.$unknown);
+  if (forceBackground !== undefined) {
+    debugLog("exec.force_background", {
+      execId: execMsg.execId,
+      execMsgId: execMsg.id,
+      fieldName: cursorExecFieldName(forceBackground),
+    });
+    const response = buildForceBackgroundNotFoundClientMessage(execMsg, forceBackground);
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, response)));
+    sendExecStreamClose(execMsg.id, sendFrame);
+    return;
+  }
+
   // --- Native Cursor tools ---
   // The model tries these before the MCP tools. When the client provides an
   // equivalent tool, redirect the call to it; otherwise reject so the model
@@ -1603,6 +1620,10 @@ function cursorExecFieldName(fieldNumber: number): string | undefined {
   switch (fieldNumber) {
     case EXEC_MCP_STATE_FIELD:
       return "mcpStateExecArgs";
+    case EXEC_FORCE_BACKGROUND_SHELL_FIELD:
+      return "forceBackgroundShellArgs";
+    case EXEC_FORCE_BACKGROUND_SUBAGENT_FIELD:
+      return "forceBackgroundSubagentArgs";
     case EXEC_ACCEPT_HOOK_ADDITIONAL_CONTEXTS_FIELD:
       return "acceptHookAdditionalContexts";
     default:
@@ -1615,6 +1636,37 @@ export function isMcpStateExecRequest(
   unknownFields: readonly UnknownField[] | undefined,
 ): boolean {
   return findUnknownField(unknownFields, EXEC_MCP_STATE_FIELD, WireType.LengthDelimited) !== undefined;
+}
+
+/**
+ * The force-background field (30 for shells, 31 for subagents) a newer Cursor
+ * sent, if any.
+ */
+export function forceBackgroundExecField(
+  unknownFields: readonly UnknownField[] | undefined,
+): number | undefined {
+  return [EXEC_FORCE_BACKGROUND_SHELL_FIELD, EXEC_FORCE_BACKGROUND_SUBAGENT_FIELD].find((no) =>
+    findUnknownField(unknownFields, no, WireType.LengthDelimited) !== undefined);
+}
+
+/**
+ * Answer a force-background request with NOT_FOUND. Shells and subagents run
+ * as OpenCode tool calls, so the proxy never owns one it could background.
+ */
+export function buildForceBackgroundNotFoundClientMessage(
+  execMsg: ExecServerMessage,
+  field: number,
+) {
+  // ForceBackground{Shell,Subagent}Result { status: NOT_FOUND }
+  const result = new BinaryWriter().tag(1, WireType.Varint).int32(FORCE_BACKGROUND_STATUS_NOT_FOUND).finish();
+  const clientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  clientMessage.$unknown = [unknownMessageField(field, result)];
+  return create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: clientMessage },
+  });
 }
 
 /**

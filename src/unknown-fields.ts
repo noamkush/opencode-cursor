@@ -29,6 +29,25 @@ export const INTERACTION_WEB_FETCH_FIELD = 9;
 export const EXEC_MCP_STATE_FIELD = 36;
 
 /**
+ * `ExecServerMessage.force_background_shell_args` (request) and
+ * `ExecClientMessage.force_background_shell_result` (response), both
+ * length-delimited messages. Cursor asks the client to background a running
+ * shell call by `tool_call_id`; the result carries a
+ * `ForceBackgroundShellStatus` in field 1.
+ */
+export const EXEC_FORCE_BACKGROUND_SHELL_FIELD = 30;
+
+/**
+ * `ExecServerMessage.force_background_subagent_args` (request) and
+ * `ExecClientMessage.force_background_subagent_result` (response), the
+ * subagent counterpart of {@link EXEC_FORCE_BACKGROUND_SHELL_FIELD}.
+ */
+export const EXEC_FORCE_BACKGROUND_SUBAGENT_FIELD = 31;
+
+/** `ForceBackgroundShellStatus.NOT_FOUND` and `ForceBackgroundSubagentStatus.NOT_FOUND`. */
+export const FORCE_BACKGROUND_STATUS_NOT_FOUND = 2;
+
+/**
  * `ExecServerMessage.accept_hook_additional_contexts`, a varint bool. Only
  * named in diagnostics; the proxy does not act on it.
  */
